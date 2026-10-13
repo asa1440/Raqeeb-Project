@@ -363,6 +363,8 @@ function paintWebcam() {
   card.querySelector(".camera-detections").textContent=D.live.error ? D.live.error :
     !D.live.stream ? T("Webcam off", "الكاميرا متوقفة") : !result ? T("Analyzing first frame…", "تحليل الإطار الأول…") :
     threats.length ? threats.map(d=>`${d.class.toUpperCase()} ${Math.round(d.conf*100)}%`).join(" · ") :
+    result.pending?.length ? result.pending.map(p=>`${T("Checking possible", "تحقق من احتمال")} ${p.class.toUpperCase()} ${Math.round(p.conf*100)}% (${p.count}/${p.needed})`).join(" · ") :
+    result.rejected?.length ? `${T("Ignored", "تم تجاهل")} ${result.rejected[0].class} ${Math.round(result.rejected[0].conf*100)}%: ${result.rejected[0].reason}` :
     `${dets.filter(d=>d.class==="person").length} ${T("people in view", "أشخاص في المشهد")}`;
 }
 function syncWebcamCard(card,c) {

@@ -73,7 +73,17 @@ class PersonIDs:
             return self.data[key]
 
 
-def detect_weapons(model, image, people, classes, confidence):
+# Validation thresholds. CCTV values are tuned for distant people in recorded
+# footage. A webcam sees one person up close: the body is cut off by the frame,
+# a held object looks large relative to it, and wrists often leave the frame.
+CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45,
+                "fallback_conf": None, "knife_observations": 3}
+WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": 1.0, "compact_moving": 1.0,
+                  "fallback_conf": .5, "knife_observations": 2,
+                  "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
+
+
+def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFILE, rejected=None):
     """Magnify small objects, then merge overlapping predictions in source pixels."""
     height, width = image.shape[:2]
     candidates = []
@@ -103,6 +113,8 @@ def detect_weapons(model, image, people, classes, confidence):
             coords = [round(x1+left, 1), round(y1+top, 1), round(x2+left, 1), round(y2+top, 1)]
             # Reject the weapon model's occasional whole-person class confusion.
             if any(box_iou(coords, person["box"]) > .5 for person in people):
+                if rejected is not None:
+                    rejected.append((classes[int(box.cls.item())], float(box.conf.item()), "box covers a whole person"))
                 continue
             candidates.append({"class": classes[int(box.cls.item())],
                                "conf": round(float(box.conf.item()), 4), "box": coords,
@@ -115,14 +127,17 @@ def detect_weapons(model, image, people, classes, confidence):
     plausible = []
     for det in merged:
         owner_id = weapon_owner(det, people)
-        if det["class"] == "knife" and det["conf"] < max(.8, confidence):
+        if det["class"] == "knife" and det["conf"] < max(profile["knife_conf"], confidence):
+            if rejected is not None:
+                rejected.append(("knife", det["conf"], f"below the {max(profile['knife_conf'], confidence):.0%} knife threshold"))
             continue
         det["person_id"] = owner_id
         plausible.append(det)
     return plausible
 
 
-def associate_hands(pose_model, weapon_model, image, detections, people, classes, confidence, previous=()):
+def associate_hands(pose_model, weapon_model, image, detections, people, classes, confidence, previous=(),
+                    profile=CCTV_PROFILE, rejected=None):
     """Use visible wrists to distinguish the holder from a nearby bystander."""
     if not detections and not people:
         return []
@@ -162,7 +177,9 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 kind, score = classes[int(box.cls.item())], float(box.conf.item())
-                if kind == "knife" and score < max(.8, confidence):
+                if kind == "knife" and score < max(profile["knife_conf"], confidence):
+                    if rejected is not None:
+                        rejected.append(("knife", score, f"below the {max(profile['knife_conf'], confidence):.0%} knife threshold"))
                     continue
                 candidates.append({"class": kind, "conf": round(score, 4),
                     "box": [round(x1+left, 1), round(y1+top, 1), round(x2+left, 1), round(y2+top, 1)],
@@ -181,18 +198,22 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
                 gap = math.hypot(max(x1-x, 0, x-x2), max(y1-y, 0, y-y2))/height
                 if gap < distance:
                     best, distance = body, gap
-        if best and distance < .12:
-            compact_limit = .3
+        if best and distance < profile["wrist_gap"]:
+            compact_limit = profile["compact"]
             for old in previous:
                 if old["class"] == det["class"] and old.get("person_id") == best["id"]:
                     old_box = old["box"]
                     travel = math.hypot((x1+x2-old_box[0]-old_box[2])/2,
                                         (y1+y2-old_box[1]-old_box[3])/2)
                     if travel < .25*(best["box"][3]-best["box"][1]):
-                        compact_limit = .45
+                        compact_limit = profile["compact_moving"]
             if max(x2-x1, y2-y1) > compact_limit*(best["box"][3]-best["box"][1]):
+                if rejected is not None:
+                    rejected.append((det["class"], det["conf"], "too large for the holder's body"))
                 continue
             if best["id"] is None:
+                if rejected is not None:
+                    rejected.append((det["class"], det["conf"], "holder is not a tracked person"))
                 continue
             # Keep the holder through adjacent, ambiguous hand overlaps.
             # Continuity applies only if that person's visible wrist remains nearby.
@@ -213,6 +234,12 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
                     break
             det["person_id"] = best["id"]
             verified.append(det)
+        elif profile["fallback_conf"] is not None and det["conf"] >= profile["fallback_conf"]:
+            # Up close the wrist is often out of frame; use the nearest person.
+            det["person_id"] = weapon_owner(det, people)
+            verified.append(det)
+        elif rejected is not None:
+            rejected.append((det["class"], det["conf"], "no visible wrist next to it"))
     return verified
 
 
@@ -282,11 +309,12 @@ class FrameProcessor:
     """
 
     def __init__(self, camera, general, weapon, weapon_classes, pose, tracker, args,
-                 person_ids, evidence, source_hash, fingerprint, adaptive=False):
+                 person_ids, evidence, source_hash, fingerprint, adaptive=False, profile=CCTV_PROFILE):
         self.camera, self.general, self.weapon, self.pose = camera, general, weapon, pose
         self.weapon_classes, self.tracker, self.args = weapon_classes, tracker, args
         self.person_ids, self.evidence = person_ids, evidence
         self.source_hash, self.fingerprint, self.adaptive = source_hash, fingerprint, adaptive
+        self.profile, self.active_profile, self.rejected = profile, profile, []
         self.selected_classes = [i for i, name in general.names.items()
                                  if name in ("person", "backpack", "handbag", "suitcase")]
         self.events, self.tracks = [], {}
@@ -337,10 +365,15 @@ class FrameProcessor:
                             track.update(snapshot_score=quality, snapshot_time=round(source_time, 4),
                                          snapshot_url=f"/api/people/{public_id}/snapshot.jpg")
         people = [d for d in detections if d["class"] == "person"]
-        weapon_dets = detect_weapons(self.weapon, image, people, self.weapon_classes, self.args.weapon_conf)
+        self.rejected = []
+        profile = self.profile if len(people) <= self.profile.get("max_people", len(people)) else CCTV_PROFILE
+        self.active_profile = profile
+        weapon_dets = detect_weapons(self.weapon, image, people, self.weapon_classes, self.args.weapon_conf,
+                                     profile, self.rejected)
         weapon_dets = associate_hands(self.pose, self.weapon, image, weapon_dets, people,
                                      self.weapon_classes, self.args.weapon_conf,
-                                     [d for t, d in self.previous_weapons if source_time-t <= hold])
+                                     [d for t, d in self.previous_weapons if source_time-t <= hold],
+                                     profile, self.rejected)
         self.previous_weapons = [(t,d) for t,d in self.previous_weapons if source_time-t <= hold]
         self.previous_weapons.extend((source_time,d) for d in weapon_dets)
         strongest = {}
@@ -363,7 +396,7 @@ class FrameProcessor:
                     pending["count"] += 1
                 # Require repeated observations of the same class and holder.
                 # Moving hands can shift the small box between samples.
-                if pending["count"] < (3 if kind == "knife" else 2):
+                if pending["count"] < (profile["knife_observations"] if kind == "knife" else 2):
                     continue
                 first = pending["det"]
                 eid = f"{self.fingerprint[:16]}-{kind}-{len(self.events)+1}"
@@ -481,7 +514,9 @@ class LiveCamera:
                 self.processor = FrameProcessor(
                     self.camera, general, weapon, weapon_classes, pose, tracker,
                     self.library.args, self.library.person_ids, self.library.evidence, session,
-                    hashlib.sha256(session.encode()).hexdigest(), adaptive=True)
+                    hashlib.sha256(session.encode()).hexdigest(), adaptive=True,
+                    profile={**WEBCAM_PROFILE, "knife_conf": getattr(self.library.args, "live_knife_conf",
+                                                                     WEBCAM_PROFILE["knife_conf"])})
             processor = self.processor
             source_time = time.monotonic() - self.session_start
             known = len(processor.events)
@@ -492,6 +527,15 @@ class LiveCamera:
                 e["class"] == d["class"] and e.get("person_id") == d.get("person_id")
                 and e["time"] <= source_time <= e["end"] + .0001 for e in processor.events)]
             frame = {"time": round(source_time, 4), "dets": detections}
+            # Weapons seen this frame that still need repeated observations.
+            pending = [{"class": kind, "conf": p["det"]["conf"], "count": p["count"],
+                        "needed": processor.active_profile["knife_observations"] if kind == "knife" else 2}
+                       for (kind, _), p in processor.pending_weapons.items() if p["last"] == source_time]
+            rejected = [{"class": kind, "conf": round(conf, 4), "reason": reason}
+                        for kind, conf, reason in processor.rejected]
+            for item in sorted(rejected, key=lambda r: -r["conf"])[:3]:
+                print(f"{LIVE_CAMERA_ID} {source_time:6.1f}s {item['class']} {item['conf']:.0%} "
+                      f"ignored: {item['reason']}", flush=True)
             self.frames = (self.frames + [frame])[-3600:]
             height, width = image.shape[:2]
             if time.monotonic() - self.last_thumbnail > 5:
@@ -507,7 +551,8 @@ class LiveCamera:
                     "sample_fps": self.library.args.analysis_fps, "live": True,
                     "frames": self.frames, "events": processor.events, "tracks": tracks}
             return {**frame, "camera": LIVE_CAMERA_ID, "width": width, "height": height,
-                    "new_events": [dict(e) for e in processor.events[known:]], "tracks": tracks}
+                    "new_events": [dict(e) for e in processor.events[known:]], "tracks": tracks,
+                    "pending": pending, "rejected": rejected}
         finally:
             self.lock.release()
 
