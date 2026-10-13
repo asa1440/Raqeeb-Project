@@ -511,8 +511,11 @@ class LiveCamera:
                 cv2.imwrite(str(self.thumbnail), placeholder)
             args = self.library.args
             general, weapon, pose = YOLO(args.model), YOLO(args.weapon_model), YOLO(args.pose_model)
+            wanted = set(getattr(args, "live_weapons", "knife").split(","))
             weapon_classes = {int(i): weapon_kind(label) for i, label in weapon.names.items()
-                              if weapon_kind(label)}
+                              if weapon_kind(label) in wanted}
+            if not weapon_classes:
+                raise ValueError(f"--live-weapons {','.join(sorted(wanted))} matches no weapon model class")
             knife_path = Path(getattr(args, "knife_model", "") or "")
             knife_class = next((i for i, kind in weapon_classes.items() if kind == "knife"), None)
             if knife_path.is_file() and knife_class is not None:
