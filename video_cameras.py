@@ -1040,9 +1040,27 @@ def make_video_handler(library):
                 return self.reply(409, {"error": "Previous webcam frame is still being analyzed"})
             return self.reply(200, result)
 
+        def training_photo(self, label, length):
+            """Save a webcam frame locally under runtime/training/<label>/ (never uploaded)."""
+            if length <= 0 or length > 8 * 1024 * 1024:
+                return self.reply(400, {"error": "Invalid photo size"})
+            data = self.rfile.read(length)
+            if not data.startswith(b"\xff\xd8"):
+                return self.reply(400, {"error": "Photo must be a JPEG"})
+            root = library.runtime / "training"
+            folder = root / label
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}.jpg").write_bytes(data)
+            counts = {name: len(list((root / name).glob("*.jpg"))) if (root / name).is_dir() else 0
+                      for name in ("knife", "none")}
+            return self.reply(200, {"saved": label, "counts": counts, "folder": str(root)})
+
         def do_POST(self):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                training = re.fullmatch(r"/api/live/training/(knife|none)", self.path)
+                if training:
+                    return self.training_photo(training.group(1), length)
                 if self.path == "/api/live/frame":
                     return self.live_frame(length)
                 if self.path == "/api/live/start":

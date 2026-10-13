@@ -322,6 +322,31 @@ function stopWebcam() {
   D.live.session++; Object.assign(D.live,{stream:null,video:null,result:null});
   syncCameraCards(); updateChrome();
 }
+/* Training photos are saved by the local server under runtime/training/ only. */
+async function captureTraining(label) {
+  const video=D.live.video;
+  if (!D.live.stream || !video?.videoWidth) return toast(T("Start the webcam first", "شغّل الكاميرا أولاً"));
+  if (D.live.capturing) return;
+  D.live.capturing=label;
+  const canvas=document.createElement("canvas"), total=20;
+  const scale=Math.min(1,1280/video.videoWidth);
+  canvas.width=Math.round(video.videoWidth*scale); canvas.height=Math.round(video.videoHeight*scale);
+  let result;
+  try {
+    for (let n=1; n<=total && D.live.stream; n++) {
+      D.live.captureNote=`${label==="knife" ? T("Saving knife photo", "حفظ صورة سكين") : T("Saving no-knife photo", "حفظ صورة بدون سكين")} ${n}/${total}`;
+      paintWebcam();
+      canvas.getContext("2d").drawImage(video,0,0,canvas.width,canvas.height);
+      const photo=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",.92));
+      const response=await fetch(api(`/api/live/training/${label}`),{method:"POST",headers:{"Content-Type":"image/jpeg"},body:photo});
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
+      result=await response.json();
+      await delay(500);
+    }
+    if (result) toast(`${T("Saved", "تم الحفظ")}: ${result.counts.knife} ${T("knife", "سكين")} · ${result.counts.none} ${T("no-knife", "بدون سكين")} — ${result.folder}`);
+  } catch (error) { toast(`${T("Could not save training photos", "تعذر حفظ صور التدريب")}: ${error.message}`); }
+  finally { D.live.capturing=""; D.live.captureNote=""; paintWebcam(); }
+}
 function toggleWebcam() { unlockSound(); D.live.stream ? stopWebcam() : startWebcam(); }
 async function liveLoop(session) {
   const canvas=document.createElement("canvas"), context=canvas.getContext("2d");
@@ -361,7 +386,7 @@ function paintWebcam() {
   card.classList.toggle("threat-active",threats.length>0);
   paintBoxes(card.querySelector(".camera-overlay"),dets,{width:result?.width || camera.width,height:result?.height || camera.height},threats);
   card.querySelector(".camera-clock").textContent=result ? `${sourceTime(result.time)} · ${(D.live.latency/1000).toFixed(1)} ${T("s/frame", "ث/إطار")}` : "--:--";
-  card.querySelector(".camera-detections").textContent=D.live.error ? D.live.error :
+  card.querySelector(".camera-detections").textContent=D.live.captureNote ? D.live.captureNote : D.live.error ? D.live.error :
     !D.live.stream ? T("Webcam off", "الكاميرا متوقفة") : !result ? T("Analyzing first frame…", "تحليل الإطار الأول…") :
     threats.length ? threats.map(d=>`${d.class.toUpperCase()} ${Math.round(d.conf*100)}%`).join(" · ") :
     result.pending?.length ? result.pending.map(p=>`${T("Checking possible", "تحقق من احتمال")} ${p.class.toUpperCase()} ${Math.round(p.conf*100)}% (${p.count}/${p.needed})`).join(" · ") :
