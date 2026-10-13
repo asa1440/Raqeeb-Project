@@ -41,6 +41,29 @@ A **CAM-LIVE** tile appears next to the recorded cameras. By default the webcam 
 - Each **Start webcam** begins a new session with fresh tracking. Source times on live incidents are seconds since the session started; `detected_at` holds the wall-clock time.
 - Browsers allow webcam access only on `localhost` or HTTPS, so open the dashboard at http://localhost:8000. Use `--no-webcam` to hide the tile.
 
+## Training the knife model (NVIDIA GPU)
+
+`train_knife.py` builds `knife.pt`, a dedicated knife detector used by the webcam. It downloads the ~3,300 Open Images photos listed in `knife_dataset.json` (knives, plus knife-free phones, pens, scissors, remotes, tools, and hands), fine-tunes `yolo26n.pt`, and compares the result with `weapon.pt` on held-out photos. It saves `knife.pt` only if the new model finds more knives without more false alarms.
+
+1. Check the GPU driver: run `nvidia-smi` and note the **CUDA Version** in the top-right corner.
+2. Install the GPU build of PyTorch into the project environment. For CUDA 12.8 or newer:
+   ```powershell
+   .venv\Scripts\python.exe -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
+   ```
+   For CUDA 12.6–12.7, use `cu126` instead of `cu128`. If the version is older, update the NVIDIA driver first.
+3. Confirm PyTorch sees the GPU (should print `True`):
+   ```powershell
+   .venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+   ```
+4. Train (about 800 MB of downloads, then roughly 10–20 minutes on a recent GPU):
+   ```powershell
+   .venv\Scripts\python.exe train_knife.py
+   ```
+   If it reports running out of GPU memory, add `--batch 8`.
+5. Restart `server.py`. The startup log shows `CAM-LIVE knives: knife.pt` when the webcam uses it.
+
+Photos go to `dataset/knife/` and training output to `runs/knife/`; both are ignored by git and can be deleted afterwards.
+
 ## Recognition and alerts
 
 - `yolo26n.pt` detects people and bags at 1280-pixel inference resolution. BoT-SORT uses motion and appearance features, with a longer track buffer, to retain person tracks through brief misses and occlusions.
