@@ -79,10 +79,13 @@ class PersonIDs:
 # Inference sizes: CCTV magnifies tiny, distant weapons with 1280-pixel passes
 # and overlapping tiles. Webcam subjects are large, so 640-pixel passes without
 # tiles find the same objects several times faster.
-CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45,
+# compact/person_overlap reject weapon.pt's whole-body class confusions. Up close,
+# a held knife fills the frame and the pose model may read the hand as a body,
+# so the webcam disables both checks (None).
+CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45, "person_overlap": .5,
                 "fallback_conf": None, "knife_observations": 3,
                 "full_size": 1280, "tiles": True, "pose_size": 1280, "hand_size": 640}
-WEBCAM_PROFILE = {"knife_conf": .7, "wrist_gap": .25, "compact": 1.0, "compact_moving": 1.0,
+WEBCAM_PROFILE = {"knife_conf": .7, "wrist_gap": .25, "compact": None, "compact_moving": None, "person_overlap": None,
                   "fallback_conf": .5, "knife_observations": 2,
                   "full_size": 640, "tiles": False, "pose_size": 640, "hand_size": 416, "track_size": 640,
                   "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
@@ -160,7 +163,8 @@ def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFI
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             coords = [round(x1+left, 1), round(y1+top, 1), round(x2+left, 1), round(y2+top, 1)]
             # Reject the weapon model's occasional whole-person class confusion.
-            if any(box_iou(coords, person["box"]) > .5 for person in people):
+            if profile["person_overlap"] is not None and any(
+                    box_iou(coords, person["box"]) > profile["person_overlap"] for person in people):
                 if rejected is not None:
                     rejected.append((classes[int(box.cls.item())], float(box.conf.item()), "box covers a whole person"))
                 continue
@@ -255,11 +259,13 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
                                         (y1+y2-old_box[1]-old_box[3])/2)
                     if travel < .25*(best["box"][3]-best["box"][1]):
                         compact_limit = profile["compact_moving"]
-            if max(x2-x1, y2-y1) > compact_limit*(best["box"][3]-best["box"][1]):
+            if compact_limit is not None and max(x2-x1, y2-y1) > compact_limit*(best["box"][3]-best["box"][1]):
                 if rejected is not None:
                     rejected.append((det["class"], det["conf"], "too large for the holder's body"))
                 continue
-            if best["id"] is None:
+            if best["id"] is None and profile["fallback_conf"] is not None and det["conf"] >= profile["fallback_conf"]:
+                best = {**best, "id": weapon_owner(det, people)}  # A hand alone may not be a tracked person.
+            elif best["id"] is None:
                 if rejected is not None:
                     rejected.append((det["class"], det["conf"], "holder is not a tracked person"))
                 continue
