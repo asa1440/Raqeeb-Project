@@ -83,6 +83,42 @@ WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": 1.0, "compact_m
                   "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
 
 
+class _Box:
+    """The subset of an Ultralytics box that the weapon pipeline reads."""
+
+    def __init__(self, xyxy, cls, conf):
+        import torch
+        self.xyxy, self.cls, self.conf = torch.tensor([xyxy]), torch.tensor(cls), torch.tensor(conf)
+
+
+class KnifeAugmentedModel:
+    """Serve guns from weapon.pt and knives from a dedicated knife model.
+
+    Exposes weapon.pt's predict interface and class indices, so detect_weapons
+    and associate_hands work unchanged.
+    """
+
+    def __init__(self, weapon, knife, knife_class):
+        self.weapon, self.knife, self.knife_class = weapon, knife, knife_class
+        self.names = weapon.names
+
+    def predict(self, source, classes, conf, imgsz, verbose=False, device="cpu"):
+        from types import SimpleNamespace
+
+        batch = source if isinstance(source, list) else [source]
+        others = [c for c in classes if c != self.knife_class]
+        guns = (self.weapon.predict(batch, classes=others, conf=conf, imgsz=imgsz, verbose=verbose, device=device)
+                if others else [None]*len(batch))
+        knives = (self.knife.predict(batch, conf=conf, imgsz=min(imgsz, 640), verbose=verbose, device=device)
+                  if self.knife_class in classes else [None]*len(batch))
+        results = []
+        for gun, knife in zip(guns, knives):
+            boxes = [_Box(b.xyxy[0].tolist(), int(b.cls.item()), float(b.conf.item())) for b in (gun.boxes if gun else [])]
+            boxes += [_Box(b.xyxy[0].tolist(), self.knife_class, float(b.conf.item())) for b in (knife.boxes if knife else [])]
+            results.append(SimpleNamespace(boxes=boxes))
+        return results
+
+
 def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFILE, rejected=None):
     """Magnify small objects, then merge overlapping predictions in source pixels."""
     height, width = image.shape[:2]
@@ -462,6 +498,11 @@ class LiveCamera:
             general, weapon, pose = YOLO(args.model), YOLO(args.weapon_model), YOLO(args.pose_model)
             weapon_classes = {int(i): weapon_kind(label) for i, label in weapon.names.items()
                               if weapon_kind(label)}
+            knife_path = Path(getattr(args, "knife_model", "") or "")
+            knife_class = next((i for i, kind in weapon_classes.items() if kind == "knife"), None)
+            if knife_path.is_file() and knife_class is not None:
+                weapon = KnifeAugmentedModel(weapon, YOLO(str(knife_path)), knife_class)
+                print(f"{LIVE_CAMERA_ID} knives: {knife_path.name}", flush=True)
             tracker = args.tracker
             tracker_path = Path(tracker)
             if tracker_path.is_file():
