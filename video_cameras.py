@@ -76,10 +76,15 @@ class PersonIDs:
 # Validation thresholds. CCTV values are tuned for distant people in recorded
 # footage. A webcam sees one person up close: the body is cut off by the frame,
 # a held object looks large relative to it, and wrists often leave the frame.
+# Inference sizes: CCTV magnifies tiny, distant weapons with 1280-pixel passes
+# and overlapping tiles. Webcam subjects are large, so 640-pixel passes without
+# tiles find the same objects several times faster.
 CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45,
-                "fallback_conf": None, "knife_observations": 3}
+                "fallback_conf": None, "knife_observations": 3,
+                "full_size": 1280, "tiles": True, "pose_size": 1280, "hand_size": 640}
 WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": 1.0, "compact_moving": 1.0,
                   "fallback_conf": .5, "knife_observations": 2,
+                  "full_size": 640, "tiles": False, "pose_size": 640, "hand_size": 416, "track_size": 640,
                   "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
 
 
@@ -119,13 +124,16 @@ class KnifeAugmentedModel:
         return results
 
 
+SIZE_KEYS = ("full_size", "tiles", "pose_size", "hand_size", "track_size")
+
+
 def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFILE, rejected=None):
     """Magnify small objects, then merge overlapping predictions in source pixels."""
     height, width = image.shape[:2]
     candidates = []
     regions = [(0, 0, width, height)]
     # Overlapping tiles preserve weapons that are tiny in a full CCTV frame.
-    for row in range(2):
+    for row in range(2 if profile["tiles"] else 0):
         for col in range(2):
             regions.append((int(width*col*.4), int(height*row*.4),
                             min(width, int(width*(col*.4+.6))),
@@ -135,13 +143,17 @@ def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFI
         for person in people:
             x1, y1, x2, y2 = person["box"]
             w, h = x2-x1, y2-y1
-            regions.append((max(0, int(x1-w*.7)), max(0, int(y1-h*.1)),
-                            min(width, int(x2+w*.7)), min(height, int(y2+h*.1))))
+            region = (max(0, int(x1-w*.7)), max(0, int(y1-h*.1)),
+                      min(width, int(x2+w*.7)), min(height, int(y2+h*.1)))
+            # Without tiles, a region covering most of the frame repeats the full pass.
+            if profile["tiles"] or (region[2]-region[0])*(region[3]-region[1]) < .6*width*height:
+                regions.append(region)
+    tiles = 5 if profile["tiles"] else 1
     for index, (left, top, right, bottom) in enumerate(regions):
         crop = image[top:bottom, left:right]
         if not crop.size:
             continue
-        size = 1280 if index == 0 else 960 if index < 5 else 640
+        size = profile["full_size"] if index == 0 else 960 if index < tiles else 640
         result = model.predict(crop, classes=list(classes), conf=confidence,
                                imgsz=size, verbose=False, device="cpu")[0]
         for box in result.boxes:
@@ -177,7 +189,7 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
     """Use visible wrists to distinguish the holder from a nearby bystander."""
     if not detections and not people:
         return []
-    poses = pose_model.predict(image, imgsz=1280, conf=.2, verbose=False, device="cpu")[0]
+    poses = pose_model.predict(image, imgsz=profile["pose_size"], conf=.2, verbose=False, device="cpu")[0]
     bodies = []
     for index, box in enumerate(poses.boxes.xyxy.tolist()):
         person = max(people, key=lambda p: box_iou(box, p["box"]), default=None)
@@ -208,7 +220,7 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
     candidates = list(detections)
     for start in range(0, len(crops), 4):
         results = weapon_model.predict(crops[start:start+4], classes=list(classes),
-            imgsz=640, conf=confidence, verbose=False, device="cpu")
+            imgsz=profile["hand_size"], conf=confidence, verbose=False, device="cpu")
         for result, (left, top) in zip(results, offsets[start:start+4]):
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -367,7 +379,7 @@ class FrameProcessor:
         self.last_time = source_time
         general, tracks = self.general, self.tracks
         result = general.track(image, persist=True, tracker=self.tracker,
-                               classes=self.selected_classes, imgsz=self.args.imgsz, conf=0.15,
+                               classes=self.selected_classes, imgsz=self.profile.get("track_size", self.args.imgsz), conf=0.15,
                                verbose=False, device="cpu")[0]
         detections = []
         for box in result.boxes:
@@ -402,7 +414,10 @@ class FrameProcessor:
                                          snapshot_url=f"/api/people/{public_id}/snapshot.jpg")
         people = [d for d in detections if d["class"] == "person"]
         self.rejected = []
-        profile = self.profile if len(people) <= self.profile.get("max_people", len(people)) else CCTV_PROFILE
+        profile = self.profile
+        if len(people) > self.profile.get("max_people", len(people)):
+            # Crowds use the CCTV thresholds at this camera's inference sizes.
+            profile = {**CCTV_PROFILE, **{k: v for k, v in self.profile.items() if k in SIZE_KEYS}}
         self.active_profile = profile
         weapon_dets = detect_weapons(self.weapon, image, people, self.weapon_classes, self.args.weapon_conf,
                                      profile, self.rejected)

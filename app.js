@@ -328,7 +328,8 @@ async function liveLoop(session) {
   while (D.live.stream && D.live.session===session) {
     const started=performance.now(), video=D.live.video;
     if (video.readyState>=2 && video.videoWidth) {
-      const scale=Math.min(1,1280/video.videoWidth);
+      // Webcam subjects are close; 640 pixels keeps encoding, upload, and inference fast.
+      const scale=Math.min(1,640/video.videoWidth);
       canvas.width=Math.round(video.videoWidth*scale); canvas.height=Math.round(video.videoHeight*scale);
       context.drawImage(video,0,0,canvas.width,canvas.height);
       const frame=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",.85));

@@ -1895,3 +1895,12 @@ body.lockdown:after {
   margin-top:10px;
   pointer-events:auto
 }
+/* Glide live boxes between analyzed frames instead of jumping */
+.webcam-card .detection-box {
+  transition:left .2s linear,top .2s linear,width .2s linear,height .2s linear
+}
+@media (prefers-reduced-motion:reduce) {
+  .webcam-card .detection-box {
+    transition:none
+  }
+}
