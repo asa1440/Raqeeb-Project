@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--weapon-conf", type=float, default=0.35, help="minimum weapon candidate score; lower-score candidates require repeated evidence (default: 0.35)")
     parser.add_argument("--knife-model", dest="knife_model", default=str(ROOT / "knife.pt"), help="dedicated knife detector for the live webcam; ignored if the file is missing")
     parser.add_argument("--live-weapons", default="knife", help="weapon classes the live webcam alerts on: knife, gun, or gun,knife (default: knife)")
-    parser.add_argument("--live-knife-conf", type=float, default=0.4, help="minimum knife score for the live webcam (default: 0.4; recorded cameras use 0.8)")
+    parser.add_argument("--live-knife-conf", type=float, default=0.7, help="minimum knife score for the live webcam (default: 0.7; recorded cameras use 0.8)")
     parser.add_argument("--no-webcam", dest="webcam", action="store_false", help="hide the live webcam camera (CAM-LIVE)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
