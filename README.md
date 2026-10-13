@@ -30,6 +30,15 @@ The server discovers video files recursively in `examples/` and `samples/`. Each
 
 Sources are labeled **RECORDED SOURCE**. There are no generated camera feeds, scripted incidents, random demo timers, simulated network logs, or fabricated analytics. Videos play muted and loop at their native frame rate. Other dashboard pages use these same camera sources, person tracks, and saved incidents.
 
+## Live webcam (CAM-LIVE)
+
+A **CAM-LIVE** tile appears next to the recorded cameras. Click **Start webcam** on the tile (or **Start monitoring**) and allow camera access. The browser streams webcam frames to the server, and each frame goes through the same pipeline as the recorded cameras: BoT-SORT person tracking with persistent `P-xxxx` IDs, tiled weapon detection, pose-based holder validation, and repeated-observation confirmation. Confirmed gun/knife detections raise the same critical alerts and saved incidents, with an annotated evidence snapshot. Live person tracks appear in People Tracking and Person Search.
+
+- Frames are analyzed as fast as the CPU allows, with one frame in flight at a time (the tile shows seconds per frame). Expect roughly 1–2 analyzed frames per second on a typical laptop CPU. The webcam view itself plays at full frame rate; boxes follow the latest analyzed frame. Live inference runs alongside recorded analysis, so it is fastest once the recorded videos are cached.
+- Because live frames are sparser than recorded samples, the weapon confirmation windows widen to span consecutive analyzed frames. Weapons still need 2 (gun) or 3 (knife) observations of the same holder. Only confirmed weapons are boxed on the live view.
+- Each **Start webcam** begins a new session with fresh tracking. Source times on live incidents are seconds since the session started; `detected_at` holds the wall-clock time.
+- Browsers allow webcam access only on `localhost` or HTTPS, so open the dashboard at http://localhost:8000. Use `--no-webcam` to hide the tile.
+
 ## Recognition and alerts
 
 - `yolo26n.pt` detects people and bags at 1280-pixel inference resolution. BoT-SORT uses motion and appearance features, with a longer track buffer, to retain person tracks through brief misses and occlusions.
@@ -62,14 +71,14 @@ Changing the models, source files, tracker, analysis resolution, sample rate, or
 | `dashboard-ui.js` | Navigation, metrics, charts, directories, and review layouts |
 | `app.js` | Camera playback, synchronized boxes/alerts, search, and incident review |
 | `server.py` | Server command-line entry point |
-| `video_cameras.py` | Video discovery, YOLO analysis, evidence, HTTP range streaming, and persistence |
+| `video_cameras.py` | Video discovery, shared per-frame YOLO pipeline (recorded and live webcam), evidence, HTTP range streaming, and persistence |
 | `start_raqeeb.cmd` | Windows launch shortcut |
 | `tracking_cleanup.py` | Fragment consolidation, unique track rows, and stable incident identifiers |
 | `camera_sources.json` | Portable initial camera assignments |
 | `yolo26n-pose.pt` | Wrist and holder validation |
 | `person_tracker.yaml` | Appearance-assisted person tracking settings |
 | `yolo26n-cls.pt` | Lightweight appearance encoder used by the tracker |
-| `raqeeb.py` | Separate legacy webcam tracking script; not used by this dashboard |
+| `raqeeb.py` | Separate legacy webcam tracking script; the dashboard's CAM-LIVE tile replaces it |
 | `samples/`, `examples/` | Input video folders (either may be absent) |
 | `tests/test_video_cameras.py` | Incident provenance, persistence, source discovery, and HTTP tests |
 

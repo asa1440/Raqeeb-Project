@@ -11,7 +11,8 @@ const T = (en, ar) => currentLang === "ar" ? ar : en;
 const D = { cameras: [], analyses: new Map(), incidents: [], connected: false,
   view: "live", query: "", running: false, frames: new Map(), shown: new Set(),
   loading: new Set(), capabilities: [], error: "", unread: 0, muted: false,
-  session: 0, focus: "", pendingAlerts: [], alertOpen: false };
+  session: 0, focus: "", pendingAlerts: [], alertOpen: false,
+  live: {stream: null, video: null, session: 0, result: null, tracks: new Map(), latency: 0, error: ""} };
 let base = (new URLSearchParams(location.search).get("ai") || stored("raqeeb.ai", "") ||
   (location.protocol === "file:" ? "http://localhost:8000" : "")).replace(/\/+$/, "");
 const api = path => `${base}${path}`;
@@ -90,7 +91,7 @@ function playbackButtons() {
   return `<button class="btn" id="monitorButton" onclick="toggleMonitoring()">${D.running ? T("Ⅱ Pause all", "Ⅱ إيقاف الكل") : T("▶ Start monitoring", "▶ بدء المراقبة")}</button><button class="btn o" onclick="restartMonitoring()">${T("↻ Restart footage", "↻ إعادة المقاطع")}</button><button class="btn o" id="soundButton" onclick="toggleSound()">${D.muted ? T("Sound off", "الصوت معطل") : T("Sound on", "الصوت مفعل")}</button>`;
 }
 function liveView() { return uiLiveView(); }
-function cameraCard(c) { return uiCameraCard(c); }
+function cameraCard(c) { return c.live ? uiWebcamCard(c) : uiCameraCard(c); }
 function syncCameraCards() {
   if (D.view !== "live") return;
   const grid = $("#cameraGrid");
@@ -101,6 +102,7 @@ function syncCameraCards() {
     let card = grid.querySelector(`[data-id="${c.id}"]`);
     if (!card) { grid.insertAdjacentHTML("beforeend", cameraCard(c)); card = grid.lastElementChild; }
     card.hidden = !matches(c) || (D.focus && D.focus !== c.id);
+    if (c.live) { syncWebcamCard(card, c); continue; }
     const status = card.querySelector(".camera-status");
     status.textContent = c.status === "ready" ? T("AI READY", "جاهز") : c.status === "analyzing" ? `${T("ANALYZING", "تحليل")} ${c.progress}%` : c.status.toUpperCase();
     status.style.setProperty("--c", c.status === "error" ? "var(--rd)" : c.status === "ready" ? "var(--gr)" : "var(--am)");
@@ -135,7 +137,7 @@ function syncCameraCards() {
       card.querySelector(".camera-poster").hidden = true;
     }
   }
-  $("#readyCount").textContent = D.cameras.filter(c => D.analyses.has(c.id)).length;
+  $("#readyCount").textContent = D.cameras.filter(c => D.analyses.has(c.id) || (c.live && c.status === "ready")).length;
   $("#connectionNote").innerHTML = !D.connected ? empty(T("Backend offline. Run <code>.venv\\Scripts\\python.exe server.py</code> and open <a href='http://localhost:8000'>localhost:8000</a>.", "الخادم غير متصل. شغّل server.py وافتح localhost:8000.")) :
     !D.cameras.length ? empty(T("No videos found. Add video files to examples/ or samples/ and restart the server.", "لا توجد مقاطع. أضف المقاطع إلى examples/ أو samples/ وأعد تشغيل الخادم.")) : "";
   paintActivity();
@@ -157,13 +159,14 @@ function toggleSound() { D.muted = !D.muted; unlockSound(); updatePlaybackChrome
 function toggleMonitoring() {
   unlockSound(); D.running = !D.running;
   document.querySelectorAll("video[data-camera]").forEach(v => D.running ? v.play().catch(() => {}) : v.pause());
+  D.running ? startWebcam() : stopWebcam();
   updatePlaybackChrome();
 }
 function restartMonitoring() {
   D.session++; D.shown.clear(); D.pendingAlerts = []; closeM(); D.running = true; unlockSound();
   D.frames.clear();
   document.querySelectorAll("video[data-camera]").forEach(v => { v.currentTime = 0; v.play().catch(() => {}); });
-  updatePlaybackChrome(); toast(T("Footage restarted. Detection alerts are rearmed.", "أعيد تشغيل المقاطع وتفعيل التنبيهات."));
+  startWebcam(); updatePlaybackChrome(); toast(T("Footage restarted. Detection alerts are rearmed.", "أعيد تشغيل المقاطع وتفعيل التنبيهات."));
 }
 function updatePlaybackChrome() {
   const button = $("#monitorButton");
@@ -286,13 +289,109 @@ function focusCamera(cid,time) {
   const card=$(`[data-id="${cid}"]`); if (!card) return;
   card.scrollIntoView({behavior:"smooth",block:"center"});
   const video=card.querySelector("video");
-  if (video && time!=null) { const seek=()=>{video.currentTime=time;video.play().catch(()=>{});}; video.readyState ? seek() : video.addEventListener("loadedmetadata",seek,{once:true}); }
+  if (video && time!=null && !video.srcObject) { const seek=()=>{video.currentTime=time;video.play().catch(()=>{});}; video.readyState ? seek() : video.addEventListener("loadedmetadata",seek,{once:true}); }
   toast(T("Camera focused. Click Show all cameras to return.", "تم التركيز على الكاميرا. اضغط عرض الكل للعودة."));
 }
 function showAllCameras() { D.focus=""; syncCameraCards(); }
 function fullscreenCamera(cid) { const el=$(`#stage-${cid}`); el?.requestFullscreen?.().catch(()=>toast(T("Full screen unavailable", "ملء الشاشة غير متاح"))); }
+/* Live webcam: the browser captures frames and the server runs the same
+   tracking and weapon-confirmation pipeline used for recorded cameras. */
+const liveCamera = () => D.cameras.find(c => c.live);
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function startWebcam() {
+  const camera=liveCamera();
+  if (!camera || D.live.stream || D.live.starting) return;
+  if (camera.status !== "ready") return toast(T("Webcam detection models are still loading", "نماذج كشف الكاميرا قيد التحميل"));
+  if (!navigator.mediaDevices?.getUserMedia) return toast(T("Webcam access requires localhost or HTTPS", "الوصول للكاميرا يتطلب localhost أو HTTPS"));
+  D.live.starting=true;
+  try {
+    const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
+    try { await post("/api/live/start",{}); } catch (error) { stream.getTracks().forEach(t=>t.stop()); throw error; }
+    const video=document.createElement("video");
+    video.muted=true; video.playsInline=true; video.srcObject=stream; await video.play();
+    D.live.session++; Object.assign(D.live,{stream,video,result:null,error:""});
+    stream.getVideoTracks()[0]?.addEventListener("ended",stopWebcam);
+    syncCameraCards(); updateChrome(); liveLoop(D.live.session);
+  } catch (error) {
+    toast(error.name==="NotAllowedError" ? T("Webcam permission was denied", "تم رفض إذن الكاميرا") : `${T("Could not start the webcam", "تعذر تشغيل الكاميرا")}: ${error.message}`);
+  } finally { D.live.starting=false; }
+}
+function stopWebcam() {
+  if (!D.live.stream) return;
+  D.live.stream.getTracks().forEach(t=>t.stop());
+  D.live.session++; Object.assign(D.live,{stream:null,video:null,result:null});
+  syncCameraCards(); updateChrome();
+}
+function toggleWebcam() { unlockSound(); D.live.stream ? stopWebcam() : startWebcam(); }
+async function liveLoop(session) {
+  const canvas=document.createElement("canvas"), context=canvas.getContext("2d");
+  while (D.live.stream && D.live.session===session) {
+    const started=performance.now(), video=D.live.video;
+    if (video.readyState>=2 && video.videoWidth) {
+      const scale=Math.min(1,1280/video.videoWidth);
+      canvas.width=Math.round(video.videoWidth*scale); canvas.height=Math.round(video.videoHeight*scale);
+      context.drawImage(video,0,0,canvas.width,canvas.height);
+      const frame=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",.85));
+      try {
+        // One frame in flight at a time: the AI pipeline sets the live sample rate.
+        const response=await fetch(api("/api/live/frame"),{method:"POST",headers:{"Content-Type":"image/jpeg"},body:frame,cache:"no-store",signal:AbortSignal.timeout(30000)});
+        if (response.ok) {
+          const result=await response.json();
+          if (D.live.session===session) handleLiveResult(result,performance.now()-started);
+        } else if (response.status!==409) throw new Error((await response.json().catch(()=>({}))).error || `Server returned ${response.status}`);
+        D.live.error="";
+      } catch (error) { D.live.error=error.message; paintWebcam(); await delay(1000); }
+    }
+    await delay(Math.max(0,1000/(D.sampleFps || 12)-(performance.now()-started)));
+  }
+}
+function handleLiveResult(result,latency) {
+  D.live.result=result; D.live.latency=latency;
+  for (const t of result.tracks) D.live.tracks.set(`${t.class}:${t.id}`,{...t,camera:result.camera,track:String(t.id)});
+  const camera=cameraById(result.camera);
+  if (camera) Object.assign(camera,{width:result.width,height:result.height});
+  for (const event of result.new_events) if (!D.shown.has(event.id)) { D.shown.add(event.id); activateEvent(event); }
+  paintWebcam();
+}
+function paintWebcam() {
+  const camera=liveCamera(), card=camera && document.querySelector(`.camera-card[data-id="${camera.id}"]`);
+  if (!card) return;
+  const result=D.live.stream ? D.live.result : null, dets=result?.dets || [], threats=dets.filter(d=>d.weapon);
+  card.classList.toggle("threat-active",threats.length>0);
+  paintBoxes(card.querySelector(".camera-overlay"),dets,{width:result?.width || camera.width,height:result?.height || camera.height},threats);
+  card.querySelector(".camera-clock").textContent=result ? `${sourceTime(result.time)} · ${(D.live.latency/1000).toFixed(1)} ${T("s/frame", "ث/إطار")}` : "--:--";
+  card.querySelector(".camera-detections").textContent=D.live.error ? D.live.error :
+    !D.live.stream ? T("Webcam off", "الكاميرا متوقفة") : !result ? T("Analyzing first frame…", "تحليل الإطار الأول…") :
+    threats.length ? threats.map(d=>`${d.class.toUpperCase()} ${Math.round(d.conf*100)}%`).join(" · ") :
+    `${dets.filter(d=>d.class==="person").length} ${T("people in view", "أشخاص في المشهد")}`;
+}
+function syncWebcamCard(card,c) {
+  const status=card.querySelector(".camera-status"), wait=card.querySelector(".camera-wait"), stage=card.querySelector(".camera-stage");
+  const streaming=!!D.live.stream;
+  status.textContent=streaming ? T("● LIVE", "● مباشر") : c.status==="ready" ? T("AI READY", "جاهز") : c.status==="error" ? "ERROR" : T("LOADING AI", "تحميل");
+  status.style.setProperty("--c", c.status==="error" ? "var(--rd)" : streaming ? "var(--rd)" : c.status==="ready" ? "var(--gr)" : "var(--am)");
+  stage.style.aspectRatio=`${c.width||16}/${c.height||9}`;
+  card.querySelector(".webcam-toggle").innerHTML=uiIcon(streaming?"pause":"play",13)+(streaming ? T("Stop webcam", "إيقاف الكاميرا") : T("Start webcam", "تشغيل الكاميرا"));
+  card.querySelector(".webcam-toggle").disabled=c.status!=="ready";
+  let video=card.querySelector("video[data-webcam]");
+  if (streaming && !video) {
+    video=document.createElement("video");
+    video.dataset.webcam=c.id; video.muted=true; video.autoplay=true; video.playsInline=true;
+    video.setAttribute("aria-label",`${c.id}: ${T("live webcam", "كاميرا مباشرة")}`);
+    stage.prepend(video);
+  }
+  if (video && !streaming) video.remove();
+  if (video && video.srcObject!==D.live.stream) { video.srcObject=D.live.stream; video.play().catch(()=>{}); }
+  card.querySelector(".camera-poster").hidden=streaming;
+  wait.hidden=streaming;
+  wait.innerHTML=c.status==="error" ? `<b>${T("Live analysis unavailable", "التحليل المباشر غير متاح")}</b><small>${esc(c.error)}</small>` :
+    c.status!=="ready" ? `<span class="loading-ring"></span><b>${T("Loading AI models", "تحميل نماذج الذكاء الاصطناعي")}</b>` :
+    `<b>${T("Webcam is off", "الكاميرا متوقفة")}</b><small>${T("Start the webcam to run live person and weapon detection", "شغّل الكاميرا لبدء كشف الأشخاص والأسلحة مباشرة")}</small><button class="btn" onclick="toggleWebcam()">${uiIcon("play",13)}${T("Start webcam", "تشغيل الكاميرا")}</button>`;
+  paintWebcam();
+}
 function tracks() {
-  return [...new Map([...D.analyses.entries()].flatMap(([cid,a]) => a.tracks.map(t => ({...t,camera:cid,track:String(t.id)}))).map(t => [t.class+":"+t.id,t])).values()];
+  const recorded=[...D.analyses.entries()].flatMap(([cid,a]) => a.tracks.map(t => ({...t,camera:cid,track:String(t.id)})));
+  return [...new Map([...recorded,...D.live.tracks.values()].map(t => [t.class+":"+t.id,t])).values()];
 }
 function openPerson(id) {
   const person=tracks().find(t=>t.class==="person" && t.id===id); if (!person) return;
@@ -323,7 +422,7 @@ function render() {
 }
 function updateChrome() {
   const ready=D.cameras.filter(c=>c.status==="ready").length;
-  $("#modeLabel").textContent=T("RECORDED CAMERAS", "كاميرات مسجلة");
+  $("#modeLabel").textContent=D.live.stream ? T("RECORDED + LIVE WEBCAM", "مسجلة + كاميرا مباشرة") : T("RECORDED CAMERAS", "كاميرات مسجلة");
   $("#aic").textContent=!D.connected ? T("AI: offline", "الذكاء الاصطناعي: غير متصل") : `${T("AI ready", "جاهز")}: ${ready}/${D.cameras.length}`;
   $("#aist").textContent=!D.connected ? "OFFLINE" : D.error ? "ERROR" : ready===D.cameras.length && ready ? "READY" : "ANALYZING";
   $("#aist").style.color=D.error ? "var(--rd)" : "var(--cy)";
@@ -346,10 +445,11 @@ async function poll() {
     const catalog=await request("/api/cameras");
     if (!Array.isArray(catalog.cameras)) throw new Error("Recorded camera backend required");
     const changed=JSON.stringify(D.cameras.map(c=>[c.id,c.status,c.analysis_revision])) !== JSON.stringify(catalog.cameras.map(c=>[c.id,c.status,c.analysis_revision]));
-    D.connected=true; D.cameras=catalog.cameras; D.capabilities=catalog.capabilities;
+    D.connected=true; D.cameras=catalog.cameras; D.capabilities=catalog.capabilities; D.sampleFps=catalog.sample_fps;
     for (const id of D.analyses.keys()) if (!cameraById(id)) { D.analyses.delete(id); D.frames.delete(id); }
     D.error=catalog.model_error || ""; D.incidents=catalog.incidents;
-    await Promise.all(D.cameras.filter(c=>c.status==="ready").map(loadAnalysis));
+    for (const c of D.cameras) if (c.live && D.live.result) Object.assign(c,{width:D.live.result.width,height:D.live.result.height});
+    await Promise.all(D.cameras.filter(c=>c.status==="ready" && !c.live).map(loadAnalysis));
     if (D.view==="live") syncCameraCards();
     else if (changed && !D.query) render();
     updateChrome(); document.querySelectorAll(".sy").forEach(e=>e.textContent=new Date().toLocaleTimeString());

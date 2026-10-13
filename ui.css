@@ -1886,3 +1886,12 @@ body.lockdown:after {
     scroll-behavior:auto!important
   }
 }
+/* Live webcam tile */
+.webcam-card .camera-source {
+  background:#c4203ad9;
+  border-color:#ff8a9a55
+}
+.webcam-card .camera-wait .btn {
+  margin-top:10px;
+  pointer-events:auto
+}

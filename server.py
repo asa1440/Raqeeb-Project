@@ -1,4 +1,4 @@
-"""Serve Raqeeb and analyze the videos in examples/ and samples/ as cameras."""
+"""Serve Raqeeb, analyze the videos in examples/ and samples/ as cameras, and analyze a live webcam."""
 
 import argparse
 from pathlib import Path
@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--imgsz", type=int, default=1280, help="person detection resolution (default: 1280)")
     parser.add_argument("--analysis-fps", type=float, default=12, help="weapon samples per source second (default: 12)")
     parser.add_argument("--weapon-conf", type=float, default=0.35, help="minimum weapon candidate score; lower-score candidates require repeated evidence (default: 0.35)")
+    parser.add_argument("--no-webcam", dest="webcam", action="store_false", help="hide the live webcam camera (CAM-LIVE)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     serve_video_cameras(parser.parse_args())

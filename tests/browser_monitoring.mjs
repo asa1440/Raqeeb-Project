@@ -11,6 +11,7 @@ const profile=join(tmpdir(),`raqeeb-monitoring-qa-${Date.now()}`);
 await mkdir(profile,{recursive:true});
 const chrome=spawn(process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe',[
   '--headless','--disable-gpu','--no-first-run','--no-default-browser-check',
+  '--use-fake-ui-for-media-stream','--use-fake-device-for-media-stream',
   '--remote-debugging-port=9237',`--user-data-dir=${profile}`,'--window-size=1917,1182','about:blank'
 ],{windowsHide:true,stdio:'ignore'});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -37,10 +38,10 @@ try {
   };
   const until=async (expression,timeout=30000)=>{const end=Date.now()+timeout;while(Date.now()<end){if(await evaluate(expression))return;await sleep(300);}throw new Error('Timed out: '+expression);};
   await cdp('Runtime.enable'); await cdp('Page.enable');
-  await until('typeof D !== "undefined" && D.cameras.length === 2 && D.analyses.size === 2',300000);
+  await until('typeof D !== "undefined" && D.cameras.filter(c=>!c.live).length === 2 && D.analyses.size === 2',300000);
   await until('document.querySelectorAll("video[data-camera]").length === 2 && [...document.querySelectorAll("video")].every(v=>v.readyState>=2)',30000);
   assert.equal(await evaluate('D.view'),'live');
-  assert.deepEqual(await evaluate('D.cameras.map(c=>c.id)'),['CAM-01','CAM-03']);
+  assert.deepEqual(await evaluate('D.cameras.filter(c=>!c.live).map(c=>c.id)'),['CAM-01','CAM-03']);
   assert(await evaluate('tracks().filter(t=>t.class==="person").every(t=>/^P-\\d{4}$/.test(t.track))'),'Person IDs must be independent of camera IDs');
   const detections=await evaluate('[...D.analyses.values()].map(a=>({camera:a.camera,gun:a.events.find(e=>e.class==="gun")}))');
   assert(detections.every(d=>d.gun),'Both remaining videos must have a genuine inferred gun occurrence');
@@ -90,6 +91,16 @@ try {
     await until('!document.body.classList.contains("lockdown")');
   }
   console.log('Verified unique person rows/photos, no early false alerts, two CAM-03 gun holders, and severity/evidence/acknowledgement for every incident.');
+  // Chrome's fake webcam device exercises the live capture and analysis loop.
+  await until('D.cameras.some(c=>c.live && c.status==="ready")',120000);
+  if(!await evaluate('!!D.live.stream')) await evaluate('startWebcam()');
+  await until('D.live.stream && D.live.result && D.live.result.camera==="CAM-LIVE"',120000);
+  await until('document.querySelector(\'.camera-card[data-id="CAM-LIVE"] video[data-webcam]\')?.readyState>=2');
+  const webcamShot=await cdp('Page.captureScreenshot',{format:'png'});
+  await writeFile(join(out,'raqeeb-live-webcam.png'),Buffer.from(webcamShot.data,'base64'));
+  await evaluate('stopWebcam()');
+  assert.equal(await evaluate('!!D.live.stream'),false);
+  console.log('Verified live webcam capture, server-side analysis, and stop.');
   const count=await evaluate('D.incidents.length');
   await evaluate('restartMonitoring()'); await sleep(700);
   assert.equal(await evaluate('D.incidents.length'),count,'Restart must not duplicate saved incidents');

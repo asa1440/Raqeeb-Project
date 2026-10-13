@@ -116,6 +116,38 @@ class VideoCameraTests(unittest.TestCase):
         self.assertEqual(people.resolve("source-one", 1), first)
         self.assertEqual(PersonIDs(path).resolve("source-one", 1), first)
 
+    def post_frame(self, body):
+        req = urllib.request.Request(self.base + "/api/live/frame", data=body,
+                                     headers={"Content-Type": "image/jpeg"}, method="POST")
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.load(error)
+
+    def test_live_frames_require_webcam_and_report_busy(self):
+        self.assertEqual(self.post_frame(b"jpeg")[0], 404)
+
+        class BusyLive:
+            def analyze(self, payload):
+                return None
+        self.library.live = BusyLive()
+        self.assertEqual(self.post_frame(b"jpeg")[0], 409)
+
+        class DecodingLive:
+            def analyze(self, payload):
+                raise ValueError("Frame is not a decodable image")
+        self.library.live = DecodingLive()
+        self.assertEqual(self.post_frame(b"not an image"), (400, {"error": "Frame is not a decodable image"}))
+
+    def test_live_camera_has_no_video_file(self):
+        self.library.cameras["CAM-LIVE"] = {"id": "CAM-LIVE", "live": True, "status": "ready"}
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(self.base + "/api/cameras/CAM-LIVE/video")
+        self.assertEqual(cm.exception.code, 404)
+        cm.exception.close()
+
     def test_weapon_is_linked_to_nearby_person_id(self):
         persons = [{"id": "P-0001", "box": [0, 0, 100, 200]},
                    {"id": "P-0002", "box": [200, 0, 300, 200]}]
