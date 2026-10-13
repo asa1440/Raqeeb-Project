@@ -109,6 +109,7 @@ class KnifeAugmentedModel:
     def __init__(self, weapon, knife, knife_class):
         self.weapon, self.knife, self.knife_class = weapon, knife, knife_class
         self.names = weapon.names
+        self.best_knife = 0.0  # Highest knife score since reset, including sub-threshold ones.
 
     def predict(self, source, classes, conf, imgsz, verbose=False, device="cpu"):
         from types import SimpleNamespace
@@ -117,12 +118,16 @@ class KnifeAugmentedModel:
         others = [c for c in classes if c != self.knife_class]
         guns = (self.weapon.predict(batch, classes=others, conf=conf, imgsz=imgsz, verbose=verbose, device=device)
                 if others else [None]*len(batch))
-        knives = (self.knife.predict(batch, conf=conf, imgsz=min(imgsz, 640), verbose=verbose, device=device)
+        knives = (self.knife.predict(batch, conf=min(conf, .1), imgsz=min(imgsz, 640), verbose=verbose, device=device)
                   if self.knife_class in classes else [None]*len(batch))
         results = []
         for gun, knife in zip(guns, knives):
             boxes = [_Box(b.xyxy[0].tolist(), int(b.cls.item()), float(b.conf.item())) for b in (gun.boxes if gun else [])]
-            boxes += [_Box(b.xyxy[0].tolist(), self.knife_class, float(b.conf.item())) for b in (knife.boxes if knife else [])]
+            for b in (knife.boxes if knife else []):
+                score = float(b.conf.item())
+                self.best_knife = max(self.best_knife, score)
+                if score >= conf:
+                    boxes.append(_Box(b.xyxy[0].tolist(), self.knife_class, score))
             results.append(SimpleNamespace(boxes=boxes))
         return results
 
@@ -493,6 +498,7 @@ class LiveCamera:
         self.session_start = 0.0
         self.frames = []
         self.last_thumbnail = 0.0
+        self.last_score_log = 0.0
         self.camera = {"id": LIVE_CAMERA_ID, "name": "Webcam", "filename": "webcam", "live": True,
                        "status": "queued", "error": None, "fps": 0, "duration": 0,
                        "width": 1280, "height": 720, "progress": 0, "samples": 0, "weapon_events": 0,
@@ -585,7 +591,14 @@ class LiveCamera:
             processor = self.processor
             source_time = time.monotonic() - self.session_start
             known = len(processor.events)
+            if isinstance(weapon, KnifeAugmentedModel):
+                weapon.best_knife = 0.0
             detections = processor.process(image, source_time)
+            best_knife = round(weapon.best_knife, 4) if isinstance(weapon, KnifeAugmentedModel) else None
+            if best_knife is not None and best_knife >= .1 and time.monotonic() - self.last_score_log >= 1:
+                needed = processor.active_profile["knife_conf"]
+                print(f"{LIVE_CAMERA_ID} {source_time:6.1f}s best knife score {best_knife:.0%} (needs {needed:.0%})", flush=True)
+                self.last_score_log = time.monotonic()
             # Live playback cannot retroactively hide unconfirmed candidates, so
             # only weapons belonging to a confirmed, ongoing event are shown.
             detections = [d for d in detections if not d["weapon"] or any(
@@ -617,7 +630,8 @@ class LiveCamera:
                     "frames": self.frames, "events": processor.events, "tracks": tracks}
             return {**frame, "camera": LIVE_CAMERA_ID, "width": width, "height": height,
                     "new_events": [dict(e) for e in processor.events[known:]], "tracks": tracks,
-                    "pending": pending, "rejected": rejected}
+                    "pending": pending, "rejected": rejected, "best_knife": best_knife,
+                    "knife_conf": processor.active_profile["knife_conf"]}
         finally:
             self.lock.release()
 
