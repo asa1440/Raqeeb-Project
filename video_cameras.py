@@ -85,7 +85,7 @@ class PersonIDs:
 CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45, "person_overlap": .5,
                 "fallback_conf": None, "knife_observations": 3,
                 "full_size": 1280, "tiles": True, "pose_size": 1280, "hand_size": 640}
-WEBCAM_PROFILE = {"knife_conf": .7, "wrist_gap": .25, "compact": None, "compact_moving": None, "person_overlap": None,
+WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": None, "compact_moving": None, "person_overlap": None,
                   "fallback_conf": .4, "knife_observations": 3,
                   "full_size": 640, "tiles": False, "pose_size": 640, "hand_size": 416, "track_size": 640,
                   "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
