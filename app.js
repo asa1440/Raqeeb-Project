@@ -288,6 +288,16 @@ async function deleteEvidence(id) {
     closeM(); render(); toast(T("Evidence deleted", "تم حذف الدليل"));
   } catch { toast(T("Could not delete the evidence", "تعذر حذف الدليل")); }
 }
+async function deleteAllEvidence() {
+  const count=D.incidents.length; if (!count) return;
+  if (!confirm(T(`Delete all ${count} incidents, including archived false positives? Webcam snapshots cannot be recovered. Recorded-camera alerts may reappear if their footage is replayed.`,
+    `حذف جميع الحوادث (${count})، بما فيها الإنذارات الكاذبة المؤرشفة؟ لا يمكن استعادة صور الكاميرا المباشرة، وقد تظهر تنبيهات الكاميرات المسجلة مجدداً عند إعادة تشغيل المقاطع.`))) return;
+  try {
+    const result=await post("/api/incidents/delete-all", {});
+    D.incidents=[]; D.unread=0; render();
+    toast(`${T("Deleted", "تم حذف")} ${result.deleted} ${T("incidents", "حوادث")}`);
+  } catch { toast(T("Could not delete the evidence", "تعذر حذف الأدلة")); }
+}
 function openAlert(id) {
   const e=D.incidents.find(e => e.id===id); if (!e) return;
   openM(`<button class="x" onclick="closeM()">×</button><h1>${esc(e.type)}</h1>${severityBadge(e.severity)}<p class="mu">${e.camera} · ${esc(e.filename)} · ${sourceTime(e.time)} · ${Math.round(e.conf*100)}%</p><img class="evidence-image" src="${api(e.snapshot_url)}" alt="Weapon detection evidence"><div class="am"><button class="btn" onclick="closeM();focusCamera('${e.camera}',${e.time})">${T("Review footage", "مراجعة المقطع")}</button><a class="btn o" href="${api(e.snapshot_url)}" download="${e.id}.jpg">${T("Download snapshot", "تحميل الصورة")}</a><button class="btn o danger" onclick="deleteEvidence('${e.id}')">${T("Delete", "حذف")}</button></div>`);

@@ -180,6 +180,18 @@ class VideoCameraTests(unittest.TestCase):
         self.assertTrue(snapshot.exists())
         self.assertEqual(self.post_json("/api/incidents/delete", {"id": "real-gun"})[0], 404)
 
+    def test_delete_all_incidents(self):
+        snapshot = self.library.evidence / "0123456789abcdef-knife-1.jpg"
+        snapshot.write_bytes(b"jpeg")
+        self.library.cameras["CAM-LIVE"] = {"id": "CAM-LIVE", "live": True, "status": "ready"}
+        self.library.incidents = [
+            {"id": "0123456789abcdef-knife-1", "camera": "CAM-LIVE", "evidence_file": snapshot.name},
+            {"id": "real-gun", "camera": "CAM-01", "evidence_file": "fedcba9876543210-gun-1.jpg"}]
+        self.assertEqual(self.post_json("/api/incidents/delete-all", {}),
+                         (200, {"deleted": 2, "snapshots_deleted": 1}))
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(json.loads(self.library.incident_path.read_text()), [])
+
     def test_weapon_is_linked_to_nearby_person_id(self):
         persons = [{"id": "P-0001", "box": [0, 0, 100, 200]},
                    {"id": "P-0002", "box": [200, 0, 300, 200]}]

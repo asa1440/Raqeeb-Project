@@ -919,6 +919,12 @@ class CameraLibrary:
                         removed_file = True
             return {"deleted": incident_id, "snapshot_deleted": removed_file}
 
+    def delete_all_incidents(self):
+        """Delete every incident, with the same snapshot rules as delete_incident."""
+        with self.lock:
+            results = [self.delete_incident(e["id"]) for e in list(self.incidents)]
+        return {"deleted": len(results), "snapshots_deleted": sum(r["snapshot_deleted"] for r in results)}
+
     def activate(self, cid, event_id):
         with self.lock:
             event = next((e for e in self.analyses.get(cid, {}).get("events", [])
@@ -1094,6 +1100,8 @@ def make_video_handler(library):
                 data = json.loads(self.rfile.read(length))
                 if self.path == "/api/incidents":
                     return self.reply(200, library.activate(data["camera"], data["event_id"]))
+                if self.path == "/api/incidents/delete-all":
+                    return self.reply(200, library.delete_all_incidents())
                 if self.path == "/api/incidents/delete":
                     try:
                         return self.reply(200, library.delete_incident(data["id"]))
