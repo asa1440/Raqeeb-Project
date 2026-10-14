@@ -148,6 +148,38 @@ class VideoCameraTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 404)
         cm.exception.close()
 
+    def post_json(self, path, data):
+        req = urllib.request.Request(self.base + path, data=json.dumps(data).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.load(error)
+
+    def test_delete_live_incident_removes_snapshot(self):
+        snapshot = self.library.evidence / "0123456789abcdef-knife-1.jpg"
+        snapshot.write_bytes(b"jpeg")
+        self.library.cameras["CAM-LIVE"] = {"id": "CAM-LIVE", "live": True, "status": "ready"}
+        self.library.analyses["CAM-LIVE"] = {"events": [{"id": "0123456789abcdef-knife-1"}]}
+        self.library.incidents = [{"id": "0123456789abcdef-knife-1", "camera": "CAM-LIVE",
+                                   "evidence_file": snapshot.name, "status": "New"}]
+        self.assertEqual(self.post_json("/api/incidents/delete", {"id": "0123456789abcdef-knife-1"}),
+                         (200, {"deleted": "0123456789abcdef-knife-1", "snapshot_deleted": True}))
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(self.library.incidents, [])
+        self.assertEqual(self.library.analyses["CAM-LIVE"]["events"], [])
+        self.assertEqual(json.loads(self.library.incident_path.read_text()), [])
+
+    def test_delete_recorded_incident_keeps_cached_snapshot(self):
+        snapshot = self.library.evidence / "fedcba9876543210-gun-1.jpg"
+        snapshot.write_bytes(b"jpeg")
+        self.library.incidents = [{"id": "real-gun", "camera": "CAM-01", "evidence_file": snapshot.name}]
+        self.assertEqual(self.post_json("/api/incidents/delete", {"id": "real-gun"})[1]["snapshot_deleted"], False)
+        self.assertTrue(snapshot.exists())
+        self.assertEqual(self.post_json("/api/incidents/delete", {"id": "real-gun"})[0], 404)
+
     def test_weapon_is_linked_to_nearby_person_id(self):
         persons = [{"id": "P-0001", "box": [0, 0, 100, 200]},
                    {"id": "P-0002", "box": [200, 0, 300, 200]}]

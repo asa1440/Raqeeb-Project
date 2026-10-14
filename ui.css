@@ -1904,3 +1904,11 @@ body.lockdown:after {
     transition:none
   }
 }
+/* Destructive action: delete evidence */
+.btn.o.danger {
+  color:var(--rd);
+  border-color:color-mix(in srgb,var(--rd) 45%,transparent)
+}
+.btn.o.danger:hover {
+  background:color-mix(in srgb,var(--rd) 14%,transparent)
+}

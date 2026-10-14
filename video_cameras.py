@@ -896,6 +896,29 @@ class CameraLibrary:
         self.incidents = updated
         json_write(self.incident_path, self.incidents)
 
+    def delete_incident(self, incident_id):
+        """Remove an incident. A webcam snapshot is deleted with it; a recorded
+        camera's snapshot is kept because the video analysis cache needs it."""
+        with self.lock:
+            incident = next((e for e in self.incidents if e["id"] == incident_id), None)
+            if incident is None:
+                raise KeyError("Unknown incident")
+            self.incidents = [e for e in self.incidents if e["id"] != incident_id]
+            json_write(self.incident_path, self.incidents)
+            camera = self.cameras.get(incident.get("camera"), {})
+            removed_file = False
+            if camera.get("live"):
+                live = self.analyses.get(incident["camera"])
+                if live:
+                    live["events"][:] = [e for e in live["events"] if e["id"] != incident_id]
+                name = incident.get("evidence_file", "")
+                if re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", name):
+                    path = self.evidence / name
+                    if path.exists():
+                        path.unlink()
+                        removed_file = True
+            return {"deleted": incident_id, "snapshot_deleted": removed_file}
+
     def activate(self, cid, event_id):
         with self.lock:
             event = next((e for e in self.analyses.get(cid, {}).get("events", [])
@@ -1071,6 +1094,11 @@ def make_video_handler(library):
                 data = json.loads(self.rfile.read(length))
                 if self.path == "/api/incidents":
                     return self.reply(200, library.activate(data["camera"], data["event_id"]))
+                if self.path == "/api/incidents/delete":
+                    try:
+                        return self.reply(200, library.delete_incident(data["id"]))
+                    except KeyError:
+                        return self.reply(404, {"error": "Unknown incident"})
                 if self.path == "/api/incidents/status":
                     if data["status"] not in ("New", "Under Review", "Investigating", "Confirmed", "False Positive", "Resolved"):
                         raise ValueError("Invalid status")

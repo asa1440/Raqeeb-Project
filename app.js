@@ -276,9 +276,21 @@ function incidentRows() {
   return D.incidents.filter(e => D.view === "inc" || active(e)).filter(matches).map(e => `<tr class="incident-row" style="--severity-color:${severityColor(e.severity)}"><td>${esc(e.detected_at.replace("T"," "))}</td><td>${e.camera}</td><td><strong>${esc(e.type)}</strong><div>${severityBadge(e.severity)}</div>${e.person_id ? `<div class="mu">${esc(e.person_id)}</div>` : ""}</td><td>${sourceTime(e.time)}</td><td>${Math.round(e.conf*100)}%</td><td><select aria-label="Incident status" onchange="setSt('${e.id}',this.value)">${statuses.map(s => `<option${s===e.status ? " selected" : ""}>${s}</option>`).join("")}</select></td><td><button class="btn o" onclick="openAlert('${e.id}')">${T("Evidence", "الأدلة")}</button></td></tr>`).join("");
 }
 function incidentsView() { return uiIncidentsView(); }
+async function deleteEvidence(id) {
+  const e=D.incidents.find(e => e.id===id); if (!e) return;
+  const live=cameraById(e.camera)?.live;
+  const warning=live ? T("Delete this incident and its snapshot? The webcam snapshot cannot be recovered.", "حذف هذا الحادث وصورته؟ لا يمكن استعادة صورة الكاميرا المباشرة.")
+    : T("Delete this incident? It may reappear if this footage is replayed, because the weapon is still in the recording.", "حذف هذا الحادث؟ قد يظهر مجدداً عند إعادة تشغيل المقطع لأن السلاح ما زال في التسجيل.");
+  if (!confirm(warning)) return;
+  try {
+    await post("/api/incidents/delete", {id});
+    D.incidents=D.incidents.filter(x => x.id!==id);
+    closeM(); render(); toast(T("Evidence deleted", "تم حذف الدليل"));
+  } catch { toast(T("Could not delete the evidence", "تعذر حذف الدليل")); }
+}
 function openAlert(id) {
   const e=D.incidents.find(e => e.id===id); if (!e) return;
-  openM(`<button class="x" onclick="closeM()">×</button><h1>${esc(e.type)}</h1>${severityBadge(e.severity)}<p class="mu">${e.camera} · ${esc(e.filename)} · ${sourceTime(e.time)} · ${Math.round(e.conf*100)}%</p><img class="evidence-image" src="${api(e.snapshot_url)}" alt="Weapon detection evidence"><div class="am"><button class="btn" onclick="closeM();focusCamera('${e.camera}',${e.time})">${T("Review footage", "مراجعة المقطع")}</button><a class="btn o" href="${api(e.snapshot_url)}" download="${e.id}.jpg">${T("Download snapshot", "تحميل الصورة")}</a></div>`);
+  openM(`<button class="x" onclick="closeM()">×</button><h1>${esc(e.type)}</h1>${severityBadge(e.severity)}<p class="mu">${e.camera} · ${esc(e.filename)} · ${sourceTime(e.time)} · ${Math.round(e.conf*100)}%</p><img class="evidence-image" src="${api(e.snapshot_url)}" alt="Weapon detection evidence"><div class="am"><button class="btn" onclick="closeM();focusCamera('${e.camera}',${e.time})">${T("Review footage", "مراجعة المقطع")}</button><a class="btn o" href="${api(e.snapshot_url)}" download="${e.id}.jpg">${T("Download snapshot", "تحميل الصورة")}</a><button class="btn o danger" onclick="deleteEvidence('${e.id}')">${T("Delete", "حذف")}</button></div>`);
 }
 function paintActivity() {
   const element=$("#recentActivity"); if (!element) return;
