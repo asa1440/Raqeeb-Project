@@ -1,13 +1,30 @@
 """Serve Raqeeb and analyze the videos in examples/ and samples/ as cameras."""
 
 import argparse
+import os
 from pathlib import Path
 from video_cameras import serve_video_cameras
 
 ROOT = Path(__file__).resolve().parent
 
 
+def load_local_env(path):
+    allowed = {"GEMINI_API_KEY", "GEMINI_MODEL"}
+    for raw_line in path.read_text(encoding="utf-8").splitlines() if path.is_file() else []:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = (part.strip() for part in line.split("=", 1))
+        if name not in allowed:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            os.environ.setdefault(name, value)
+
+
 def main():
+    load_local_env(ROOT / ".env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--videos", help="video directory; defaults to examples/ and samples/")
     parser.add_argument("--model", default=str(ROOT / "yolo26n.pt"))

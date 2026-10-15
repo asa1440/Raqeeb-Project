@@ -11,7 +11,7 @@ const T = (en, ar) => currentLang === "ar" ? ar : en;
 const D = { cameras: [], analyses: new Map(), incidents: [], connected: false,
   view: "live", query: "", running: false, frames: new Map(), shown: new Set(),
   loading: new Set(), capabilities: [], error: "", unread: 0, muted: false,
-  session: 0, focus: "", pendingAlerts: [], alertOpen: false };
+  session: 0, focus: "", pendingAlerts: [], alertOpen: false, chatBusy: false };
 let base = (new URLSearchParams(location.search).get("ai") || stored("raqeeb.ai", "") ||
   (location.protocol === "file:" ? "http://localhost:8000" : "")).replace(/\/+$/, "");
 const api = path => `${base}${path}`;
@@ -365,17 +365,36 @@ function bell() {
 }
 function toggleChat() { const opened=$("#chat").classList.toggle("on"); $("#chatLaunchBtn").setAttribute("aria-expanded",opened); if(opened) $("#chatInput").focus(); }
 function submitChat(event) { event.preventDefault(); chatSearch($("#chatInput").value); }
-function chatSearch(query) {
-  query=query.trim(); if (!query) return;
-  const normalized=query.toLowerCase(), colors={blue:["blue","أزرق","ازرق"],black:["black","dark","أسود","اسود"],white:["white","أبيض","ابيض"],red:["red","أحمر","احمر"],green:["green","أخضر","اخضر"],gray:["gray","grey","رمادي"],yellow:["yellow","أصفر","اصفر"],purple:["purple","بنفسجي"]};
-  const color=Object.keys(colors).find(k=>colors[k].some(v=>normalized.includes(v)));
-  const camera=D.cameras.find(c=>normalized.includes(c.id.toLowerCase()));
-  const results=tracks().filter(t=>t.class==="person" && (!camera || camera.id===t.camera) &&
-    (color ? (t.color || "").toLowerCase()===color : normalized.includes(t.track.toLowerCase()) || !!camera || [t.track,t.color].join(" ").toLowerCase().includes(normalized)));
-  const message=document.createElement("div"); message.className="chat-msg user"; message.textContent=query; $("#chatLog").append(message);
-  const note=document.createElement("div"); note.className="chat-msg"; note.textContent=results.length ? `${results.length} ${T("matching tracks in analyzed footage", "نتائج مطابقة في المقاطع المحللة")}` : T("No matching person tracks. Try a clothing color or camera ID.", "لا يوجد شخص مطابق. جرب لون الملابس أو معرف الكاميرا."); $("#chatLog").append(note);
-  for (const t of results.slice(0,20)) { const el=document.createElement("div"); el.className="chat-result"; el.innerHTML=`<b>${t.track}</b><p>${esc(t.color)} · ${t.camera} · ${sourceTime(t.first_seen)}–${sourceTime(t.last_seen)}</p><button class="btn o" onclick="toggleChat();focusCamera('${t.camera}',${t.first_seen})">${T("View footage", "عرض المقطع")}</button>`; $("#chatLog").append(el); }
-  $("#chatInput").value=""; $("#chatLog").scrollTop=$("#chatLog").scrollHeight;
+async function chatSearch(query) {
+  query=query.trim(); if (!query || D.chatBusy) return;
+  D.chatBusy=true;
+  const submit=$("#chatSubmitBtn"), log=$("#chatLog");
+  const message=document.createElement("div"); message.className="chat-msg user"; message.textContent=query; log.append(message);
+  const answer=document.createElement("div"); answer.className="chat-msg"; answer.setAttribute("aria-live","polite");
+  answer.textContent=T("Reviewing person tracks and snapshots…", "جارٍ مراجعة سجلات الأشخاص واللقطات…"); log.append(answer);
+  $("#chatInput").value=""; submit.disabled=true; submit.textContent=T("Thinking…", "جارٍ التحليل…");
+  log.scrollTop=log.scrollHeight;
+  try {
+    const response=await fetch(api("/api/chat"), {method:"POST",cache:"no-store",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({message:query}),signal:AbortSignal.timeout(60000)});
+    const result=await response.json();
+    if(!response.ok) throw new Error(result.error || `Server returned ${response.status}`);
+    answer.textContent=result.answer;
+    for(const image of result.images || []) {
+      const figure=document.createElement("figure"); figure.className="chat-image";
+      const link=document.createElement("a"); link.href=api(image.url); link.target="_blank"; link.rel="noopener noreferrer";
+      const photo=document.createElement("img"); photo.src=api(image.url); photo.loading="lazy";
+      photo.alt=`${image.kind === "incident" ? T("Incident evidence", "دليل الحادث") : T("Person snapshot", "لقطة الشخص")} ${image.id}`;
+      const caption=document.createElement("figcaption");
+      caption.textContent=`${image.kind === "incident" ? T("Incident", "حادث") : T("Person", "شخص")} ${image.id} · ${image.camera}`;
+      link.append(photo); figure.append(link,caption); log.append(figure);
+    }
+  } catch(error) {
+    answer.textContent=`${T("Assistant error", "تعذر تشغيل المساعد")}: ${error.message}`;
+  } finally {
+    D.chatBusy=false; submit.disabled=false; submit.textContent=T("Ask", "إرسال");
+    log.scrollTop=log.scrollHeight;
+  }
 }
 document.addEventListener("keydown",event=>{
   const typing=event.target.matches("input,textarea,select,[contenteditable]");
