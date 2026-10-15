@@ -1464,6 +1464,30 @@ body.lockdown:after {
 .chat-result .btn {
   justify-self:start
 }
+.chat-image {
+  width:min(100%,280px);
+  margin:0;
+  border:1px solid var(--bd);
+  border-radius:7px;
+  overflow:hidden;
+  background:var(--c2)
+}
+.chat-image img {
+  display:block;
+  width:100%;
+  max-height:220px;
+  object-fit:contain;
+  background:#101614
+}
+.chat-image figcaption {
+  padding:8px 10px;
+  color:var(--mu);
+  font-size:10px
+}
+.chat-msg {
+  white-space:pre-wrap;
+  overflow-wrap:anywhere
+}
 #chatForm {
   display:flex;
   gap:8px;
@@ -1886,29 +1910,67 @@ body.lockdown:after {
     scroll-behavior:auto!important
   }
 }
-/* Live webcam tile */
-.webcam-card .camera-source {
-  background:#c4203ad9;
-  border-color:#ff8a9a55
-}
-.webcam-card .camera-wait .btn {
-  margin-top:10px;
-  pointer-events:auto
-}
-/* Glide live boxes between analyzed frames instead of jumping */
-.webcam-card .detection-box {
-  transition:left .2s linear,top .2s linear,width .2s linear,height .2s linear
-}
-@media (prefers-reduced-motion:reduce) {
-  .webcam-card .detection-box {
-    transition:none
-  }
-}
-/* Destructive action: delete evidence */
-.btn.o.danger {
-  color:var(--rd);
-  border-color:color-mix(in srgb,var(--rd) 45%,transparent)
-}
-.btn.o.danger:hover {
-  background:color-mix(in srgb,var(--rd) 14%,transparent)
-}
+.webcam-controls { display:flex; align-items:center; gap:24px; flex-wrap:wrap; padding:15px 18px; }
+.webcam-controls label { display:flex; align-items:center; gap:12px; font-size:12px; }
+.webcam-controls select { background:var(--c2); color:var(--tx); border:1px solid var(--bd); border-radius:6px; padding:9px 12px; max-width:350px; }
+.webcam-controls>.mu { font-size:11px; }
+.webcam-grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(260px,1fr); gap:20px; align-items:start; }
+.webcam-grid>aside { min-width:0; }
+.webcam-stage { aspect-ratio:16/9; max-height:none; width:100%; }
+.webcam-stage>img { position:absolute; inset:0; width:100%; height:100%; object-fit:fill; }
+.webcam-preview { aspect-ratio:16/9; position:relative; background:var(--video-bg); overflow:hidden; }
+.webcam-preview video { width:100%; height:100%; object-fit:contain; }
+.webcam-preview.preview-idle:after { content:'CAMERA OFF'; position:absolute; inset:0; display:grid; place-items:center; color:var(--mu); font-size:10px; letter-spacing:2px; }
+[lang=ar] .webcam-preview.preview-idle:after { content:'الكاميرا متوقفة'; letter-spacing:0; }
+.webcam-note { padding:15px 17px; font-size:11px; line-height:1.8; }
+.webcam-help { display:grid; gap:15px; }
+.webcam-help p { font-size:12px; line-height:1.8; }
+.webcam-error { color:var(--rd); background:color-mix(in srgb,var(--rd) 8%,var(--card)); border:1px solid color-mix(in srgb,var(--rd) 40%,var(--bd)); padding:15px; border-radius:8px; }
+@media(max-width:1100px) { .webcam-grid { grid-template-columns:1fr; } .webcam-grid>aside { grid-template-columns:1fr 1fr; } }
+@media(max-width:700px) { .webcam-grid>aside { grid-template-columns:1fr; } .webcam-controls { gap:12px; } .webcam-controls label { width:100%; } .webcam-controls select { min-width:0; width:100%; } }
+
+/* ---- Expo 2030 3D site map (Overview) ---- */
+.site-map-card { padding: 0; overflow: hidden; }
+.site-map-card .section-head { padding: 16px 18px 0; }
+.site-map-shell { position: relative; margin-top: 12px; height: 470px; border-top: 1px solid var(--bd); border-bottom: 1px solid var(--bd); background: radial-gradient(120% 130% at 50% 0%, color-mix(in srgb, var(--cy) 9%, var(--card)) 0%, var(--card) 62%); }
+.site-map-shell canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.site-map-hud { position: absolute; inset: 0; padding: 12px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; pointer-events: none; }
+.site-map-hud > * { pointer-events: auto; }
+.site-map-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 8px 12px; border: 1px solid var(--bd); border-radius: 8px; background: color-mix(in srgb, var(--card) 88%, transparent); font-size: 11px; color: var(--mu); }
+.site-map-summary b { color: var(--tx); }
+.site-map-views { display: flex; flex-wrap: wrap; gap: 6px; }
+.site-map-views .btn { padding: 5px 10px; font-size: 11px; }
+.site-map-detail { margin-top: auto; max-width: 360px; padding: 12px 14px; border: 1px solid var(--bd); border-radius: 10px; background: color-mix(in srgb, var(--card) 93%, transparent); }
+.site-map-detail-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.site-map-detail-head b { font: 600 13px "IBM Plex Mono", ui-monospace, monospace; }
+.site-map-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px 14px; margin-bottom: 10px; font-size: 12px; }
+.site-map-detail-grid small { display: block; color: var(--mu); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+.site-map-detail .btn { width: 100%; }
+.site-map-note { padding: 10px 18px 16px; font-size: 10px; }
+@media (max-width: 820px) { .site-map-shell { height: 350px; } .site-map-detail { max-width: 100%; } }
+.site-map-shell { height:560px; }
+.site-map-tracking { display:flex; gap:10px 18px; flex-wrap:wrap; align-items:center; width:100%; padding:10px 12px; background:color-mix(in srgb,var(--card) 94%,transparent); border:1px solid var(--bd); border-radius:8px; font-size:11px; }
+.site-map-tracking>span { display:flex; align-items:center; gap:6px; }
+.site-map-tracking>small { color:var(--mu); font-size:10px; }
+.map-person-dot,.map-incident-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:#64b5ff; }
+.map-incident-dot { background:#ff5279; box-shadow:0 0 0 3px #ff527922; }
+.map-webcam-binding { margin-inline-start:auto; display:flex; align-items:center; gap:7px; color:var(--mu); font-size:10px; }
+.map-webcam-binding select { padding:5px 7px; max-width:220px; min-width:0; border-radius:5px; border:1px solid var(--bd); color:var(--tx); background:var(--c2); font:inherit; }
+.map-placement-warning { padding:7px 12px; border:1px solid var(--am); border-radius:6px; background:var(--card); color:var(--am); font-size:10px; }
+.map-person-detail { position:absolute; inset-inline-end:12px; bottom:12px; display:grid; gap:8px; padding:14px; background:var(--card); border:1px solid var(--bd); border-radius:8px; min-width:180px; font-size:12px; }
+.map-person-detail>span { color:var(--mu); font-size:10px; }
+.site-map-note { display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+@media(max-width:820px) { .site-map-shell { height:480px; } .site-map-tracking { gap:7px 12px; font-size:10px; } .map-webcam-binding { margin:0; flex-basis:100%; } .map-webcam-binding select { max-width:170px; } .site-map-detail { max-width:240px; padding:8px; font-size:10px; } .site-map-summary { font-size:9px; gap:7px; } .site-map-views .btn { font-size:9px; padding:5px 7px; } .site-map-note { font-size:9px; } }
+
+/* ---- Workflow Stepper & Evidence Scrubber & Health Metrics ---- */
+.wf { display:flex; gap:6px; overflow-x:auto; margin:14px 0; padding:2px; }
+.wf div { flex:1; min-width:96px; text-align:center; font-size:11px; padding:8px 6px; border-radius:8px; border:1px solid var(--bd); color:var(--mu); background:var(--c2); white-space:nowrap; }
+.wf .d { color:var(--gr); border-color:#34d39955; background:color-mix(in srgb, var(--gr) 12%, var(--card)); }
+.wf .a { color:var(--cy); border-color:var(--cy); box-shadow:0 0 12px #22d3ee2a; font-weight:600; background:color-mix(in srgb, var(--cy) 15%, var(--card)); }
+.hb { display:grid; grid-template-columns:180px 1fr 50px; gap:12px; align-items:center; margin:8px 0; font-size:12px; }
+.evidence-scrubber { margin:14px 0; display:grid; gap:8px; padding:12px; background:var(--c2); border:1px solid var(--bd); border-radius:10px; }
+.scrubber-track { display:flex; align-items:center; gap:10px; }
+.scrubber-track input[type="range"] { flex:1; accent-color:var(--cy); cursor:pointer; }
+.scrubber-labels { display:flex; justify-content:space-between; font-size:11px; color:var(--mu); padding:0 4px; }
+.cam24-card { border-color:#fbbf2466; background:linear-gradient(180deg, color-mix(in srgb, var(--am) 14%, var(--card)), var(--card)); }
+.chip.on { border-color:var(--cy); color:var(--cy); background:color-mix(in srgb, var(--cy) 12%, var(--card)); }

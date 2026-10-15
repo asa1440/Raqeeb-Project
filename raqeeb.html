@@ -31,6 +31,7 @@
           <div class="header-context"><span>Workspace /</span><strong id="breadcrumb">Live Monitoring</strong></div>
           <div class="header-controls">
           <span class="chip mode-chip" id="modeLabel">RECORDED CAMERAS</span>
+          <button class="chip" id="dm" type="button" onclick="toggleDemo()" aria-label="Toggle demo simulation">Demo: OFF</button>
           <button class="chip" id="aic" onclick="go('health')" aria-label="View system health">AI: offline</button>
           <button class="chip" onclick="bell()" aria-label="Notifications"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M9 21h6"/></svg><b id="bc">0</b></button>
           <button class="chip icon-chip" id="themeToggle" type="button" onclick="toggleTheme()" aria-label="Toggle theme" title="Toggle theme">🌙 Dark</button>
@@ -55,13 +56,13 @@
       aria-controls="chat"
       aria-expanded="false"
     >
-      ◌ Person Search
+      ◌ AI Assistant
     </button>
-    <section id="chat" aria-label="Person search assistant">
+    <section id="chat" aria-label="AI camera assistant">
       <div id="chatHead">
         <div>
-          <b id="chatTitle">Person Search Assistant</b>
-          <div class="mu" id="chatSub" style="font-size: 11px">Search AI tracks from your camera footage</div>
+          <b id="chatTitle">AI Camera Assistant</b>
+          <div class="mu" id="chatSub" style="font-size: 11px">Ask about people, incidents, and camera evidence</div>
         </div>
         <button
           class="x"
@@ -74,25 +75,25 @@
       </div>
       <div id="chatLog" aria-live="polite">
         <div class="chat-msg" id="chatWelcome">
-          Describe someone to search live AI tracks and demo records. Try: “Find a person wearing a blue shirt.”
+          Ask about people, clothing, incidents, or evidence in the analyzed camera footage.
         </div>
         <button
           class="chip"
           id="chatSampleChip"
           type="button"
-          onclick="chatSearch(currentLang === 'ar' ? 'البحث عن شخص يرتدي قميصاً أزرق' : 'Find a person wearing a blue shirt')"
+          onclick="chatSearch(currentLang === 'ar' ? 'لخّص الحوادث المفتوحة' : 'Summarize the open incidents')"
         >
-          Find person in a blue shirt
+          Summarize the open incidents
         </button>
       </div>
       <form id="chatForm" onsubmit="submitChat(event)">
         <input
           id="chatInput"
           autocomplete="off"
-          placeholder="Describe clothing, location, or ID…"
-          aria-label="Describe a person"
+          placeholder="Ask a question about the camera footage…"
+          aria-label="Ask about camera footage"
         />
-        <button class="btn" id="chatSubmitBtn" type="submit" aria-label="Search">Search</button>
+        <button class="btn" id="chatSubmitBtn" type="submit" aria-label="Ask">Ask</button>
       </form>
     </section>
           </div>
@@ -106,6 +107,9 @@
     </div>
     <div id="ts"></div>
     <script src="dashboard-ui.js"></script>
+    <script src="webcam.js"></script>
+    <script src="site-map-tracking.js"></script>
+    <script src="site-map-3d.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

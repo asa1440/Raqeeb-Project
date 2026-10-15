@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 runtime/
+.env
+.env.*
+!.env.example

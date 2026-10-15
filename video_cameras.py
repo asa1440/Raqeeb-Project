@@ -4,6 +4,7 @@ Videos are analyzed locally once, then played at their native frame rate in the
 browser. Detections are indexed by source timestamp, never by a demo timer.
 """
 
+import base64
 import csv
 import hashlib
 import io
@@ -18,11 +19,22 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 ANALYSIS_VERSION = 11
+CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45, "person_overlap": .5,
+                "fallback_conf": None, "knife_observations": 3,
+                "full_size": 1280, "tiles": True, "pose_size": 1280, "hand_size": 640}
+WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": None, "compact_moving": None, "person_overlap": None,
+                  "fallback_conf": .4, "knife_observations": 3,
+                  "full_size": 640, "tiles": False, "pose_size": 416, "hand_size": 416, "track_size": 416,
+                  "hand_refinement": False,
+                  "max_people": 3}
+SIZE_KEYS = ("full_size", "tiles", "pose_size", "hand_size", "track_size", "hand_refinement")
 
 
 def weapon_kind(label):
@@ -33,6 +45,46 @@ def weapon_kind(label):
            ("gun", "guns", "pistol", "handgun", "rifle", "firearm", "revolver", "shotgun")):
         return "gun"
     return None
+
+
+class _Box:
+    """Expose the Ultralytics box attributes used by the weapon validation pipeline."""
+
+    def __init__(self, xyxy, cls, conf):
+        import torch
+        self.xyxy, self.cls, self.conf = torch.tensor([xyxy]), torch.tensor(cls), torch.tensor(conf)
+
+
+class KnifeAugmentedModel:
+    """Combine the general weapon model with a dedicated close-range knife model."""
+
+    def __init__(self, weapon, knife, knife_class):
+        self.weapon, self.knife, self.knife_class = weapon, knife, knife_class
+        self.names = weapon.names
+        self.best_knife = 0.0
+
+    def predict(self, source, classes, conf, imgsz, verbose=False, device="cpu"):
+        from types import SimpleNamespace
+
+        batch = source if isinstance(source, list) else [source]
+        others = [class_id for class_id in classes if class_id != self.knife_class]
+        weapons = (self.weapon.predict(batch, classes=others, conf=conf, imgsz=imgsz,
+                                       verbose=verbose, device=device)
+                   if others else [None] * len(batch))
+        knives = (self.knife.predict(batch, conf=min(conf, .1), imgsz=min(imgsz, 640),
+                                     verbose=verbose, device=device)
+                  if self.knife_class in classes else [None] * len(batch))
+        results = []
+        for weapon_result, knife_result in zip(weapons, knives):
+            boxes = [_Box(box.xyxy[0].tolist(), int(box.cls.item()), float(box.conf.item()))
+                     for box in (weapon_result.boxes if weapon_result else [])]
+            for box in (knife_result.boxes if knife_result else []):
+                score = float(box.conf.item())
+                self.best_knife = max(self.best_knife, score)
+                if score >= conf:
+                    boxes.append(_Box(box.xyxy[0].tolist(), self.knife_class, score))
+            results.append(SimpleNamespace(boxes=boxes))
+        return results
 
 
 def box_iou(a, b):
@@ -60,80 +112,17 @@ class PersonIDs:
 
     def __init__(self, path):
         self.path = path
-        self.lock = threading.Lock()  # Recorded analysis and the live webcam both allocate IDs.
+        self.lock = threading.RLock()
         self.data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
     def resolve(self, source_hash, track_id):
-        key = f"{source_hash}:{track_id}"
         with self.lock:
+            key = f"{source_hash}:{track_id}"
             if key not in self.data:
                 number = max((int(v.split("-")[1]) for v in self.data.values()), default=0) + 1
                 self.data[key] = f"P-{number:04d}"
                 json_write(self.path, self.data)
             return self.data[key]
-
-
-# Validation thresholds. CCTV values are tuned for distant people in recorded
-# footage. A webcam sees one person up close: the body is cut off by the frame,
-# a held object looks large relative to it, and wrists often leave the frame.
-# Inference sizes: CCTV magnifies tiny, distant weapons with 1280-pixel passes
-# and overlapping tiles. Webcam subjects are large, so 640-pixel passes without
-# tiles find the same objects several times faster.
-# compact/person_overlap reject weapon.pt's whole-body class confusions. Up close,
-# a held knife fills the frame and the pose model may read the hand as a body,
-# so the webcam disables both checks (None).
-CCTV_PROFILE = {"knife_conf": .8, "wrist_gap": .12, "compact": .3, "compact_moving": .45, "person_overlap": .5,
-                "fallback_conf": None, "knife_observations": 3,
-                "full_size": 1280, "tiles": True, "pose_size": 1280, "hand_size": 640}
-WEBCAM_PROFILE = {"knife_conf": .5, "wrist_gap": .25, "compact": None, "compact_moving": None, "person_overlap": None,
-                  "fallback_conf": .4, "knife_observations": 3,
-                  "full_size": 640, "tiles": False, "pose_size": 640, "hand_size": 416, "track_size": 640,
-                  "max_people": 3}  # Crowded frames fall back to the CCTV thresholds.
-
-
-class _Box:
-    """The subset of an Ultralytics box that the weapon pipeline reads."""
-
-    def __init__(self, xyxy, cls, conf):
-        import torch
-        self.xyxy, self.cls, self.conf = torch.tensor([xyxy]), torch.tensor(cls), torch.tensor(conf)
-
-
-class KnifeAugmentedModel:
-    """Serve guns from weapon.pt and knives from a dedicated knife model.
-
-    Exposes weapon.pt's predict interface and class indices, so detect_weapons
-    and associate_hands work unchanged.
-    """
-
-    def __init__(self, weapon, knife, knife_class):
-        self.weapon, self.knife, self.knife_class = weapon, knife, knife_class
-        self.names = weapon.names
-        self.best_knife = 0.0  # Highest knife score since reset, including sub-threshold ones.
-
-    def predict(self, source, classes, conf, imgsz, verbose=False, device="cpu"):
-        from types import SimpleNamespace
-
-        batch = source if isinstance(source, list) else [source]
-        others = [c for c in classes if c != self.knife_class]
-        guns = (self.weapon.predict(batch, classes=others, conf=conf, imgsz=imgsz, verbose=verbose, device=device)
-                if others else [None]*len(batch))
-        knives = (self.knife.predict(batch, conf=min(conf, .1), imgsz=min(imgsz, 640), verbose=verbose, device=device)
-                  if self.knife_class in classes else [None]*len(batch))
-        results = []
-        for gun, knife in zip(guns, knives):
-            boxes = [_Box(b.xyxy[0].tolist(), int(b.cls.item()), float(b.conf.item())) for b in (gun.boxes if gun else [])]
-            for b in (knife.boxes if knife else []):
-                score = float(b.conf.item())
-                self.best_knife = max(self.best_knife, score)
-                if score >= conf:
-                    boxes.append(_Box(b.xyxy[0].tolist(), self.knife_class, score))
-            results.append(SimpleNamespace(boxes=boxes))
-        return results
-
-
-SIZE_KEYS = ("full_size", "tiles", "pose_size", "hand_size", "track_size")
-
 
 def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFILE, rejected=None):
     """Magnify small objects, then merge overlapping predictions in source pixels."""
@@ -153,7 +142,6 @@ def detect_weapons(model, image, people, classes, confidence, profile=CCTV_PROFI
             w, h = x2-x1, y2-y1
             region = (max(0, int(x1-w*.7)), max(0, int(y1-h*.1)),
                       min(width, int(x2+w*.7)), min(height, int(y2+h*.1)))
-            # Without tiles, a region covering most of the frame repeats the full pass.
             if profile["tiles"] or (region[2]-region[0])*(region[3]-region[1]) < .6*width*height:
                 regions.append(region)
     tiles = 5 if profile["tiles"] else 1
@@ -210,22 +198,23 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
     # second weapon. This is especially useful for distant people in crowds.
     height, width = image.shape[:2]
     crops, offsets = [], []
-    for body in bodies:
-        body_height = body["box"][3]-body["box"][1]
-        if body_height < 120:
-            continue
-        centers = []
-        for x, y in body["wrists"]:
-            if any(math.hypot(x-px, y-py) < .15*body_height for px, py in centers):
+    if profile.get("hand_refinement", True):
+        for body in bodies:
+            body_height = body["box"][3]-body["box"][1]
+            if body_height < 120:
                 continue
-            centers.append((x, y))
-            radius = max(48, int(body_height*.4))
-            left, top = max(0, int(x-radius)), max(0, int(y-radius))
-            right, bottom = min(width, int(x+radius)), min(height, int(y+radius))
-            crop = image[top:bottom, left:right]
-            if crop.size:
-                crops.append(crop)
-                offsets.append((left, top))
+            centers = []
+            for x, y in body["wrists"]:
+                if any(math.hypot(x-px, y-py) < .15*body_height for px, py in centers):
+                    continue
+                centers.append((x, y))
+                radius = max(48, int(body_height*.4))
+                left, top = max(0, int(x-radius)), max(0, int(y-radius))
+                right, bottom = min(width, int(x+radius)), min(height, int(y+radius))
+                crop = image[top:bottom, left:right]
+                if crop.size:
+                    crops.append(crop)
+                    offsets.append((left, top))
     candidates = list(detections)
     for start in range(0, len(crops), 4):
         results = weapon_model.predict(crops[start:start+4], classes=list(classes),
@@ -268,12 +257,13 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
                 if rejected is not None:
                     rejected.append((det["class"], det["conf"], "too large for the holder's body"))
                 continue
-            if best["id"] is None and profile["fallback_conf"] is not None and det["conf"] >= profile["fallback_conf"]:
-                best = {**best, "id": weapon_owner(det, people)}  # A hand alone may not be a tracked person.
-            elif best["id"] is None:
-                if rejected is not None:
-                    rejected.append((det["class"], det["conf"], "holder is not a tracked person"))
-                continue
+            if best["id"] is None:
+                if profile["fallback_conf"] is not None and det["conf"] >= profile["fallback_conf"]:
+                    best = {**best, "id": weapon_owner(det, people)}
+                else:
+                    if rejected is not None:
+                        rejected.append((det["class"], det["conf"], "holder is not a tracked person"))
+                    continue
             # Keep the holder through adjacent, ambiguous hand overlaps.
             # Continuity applies only if that person's visible wrist remains nearby.
             for old in previous:
@@ -294,7 +284,6 @@ def associate_hands(pose_model, weapon_model, image, detections, people, classes
             det["person_id"] = best["id"]
             verified.append(det)
         elif profile["fallback_conf"] is not None and det["conf"] >= profile["fallback_conf"]:
-            # Up close the wrist is often out of frame; use the nearest person.
             det["person_id"] = weapon_owner(det, people)
             verified.append(det)
         elif rejected is not None:
@@ -359,283 +348,6 @@ def clothing_color(image, box):
     return "Purple"
 
 
-class FrameProcessor:
-    """Per-frame tracking, person snapshots, and validated weapon events.
-
-    Recorded analysis and the live webcam share this pipeline. Live frames
-    arrive at the speed of inference, so ``adaptive`` widens the continuity
-    windows to span a few samples; recorded analysis keeps fixed windows.
-    """
-
-    def __init__(self, camera, general, weapon, weapon_classes, pose, tracker, args,
-                 person_ids, evidence, source_hash, fingerprint, adaptive=False, profile=CCTV_PROFILE):
-        self.camera, self.general, self.weapon, self.pose = camera, general, weapon, pose
-        self.weapon_classes, self.tracker, self.args = weapon_classes, tracker, args
-        self.person_ids, self.evidence = person_ids, evidence
-        self.source_hash, self.fingerprint, self.adaptive = source_hash, fingerprint, adaptive
-        self.profile, self.active_profile, self.rejected = profile, profile, []
-        self.selected_classes = [i for i, name in general.names.items()
-                                 if name in ("person", "backpack", "handbag", "suitcase")]
-        self.events, self.tracks = [], {}
-        self.active_weapons, self.pending_weapons, self.previous_weapons = {}, {}, []
-        self.last_time = None
-
-    def process(self, image, source_time):
-        import cv2
-
-        hold, gap = .4, .6
-        if self.adaptive and self.last_time is not None:
-            interval = source_time - self.last_time
-            hold, gap = max(hold, 1.5*interval), max(gap, 2.5*interval)
-        self.last_time = source_time
-        general, tracks = self.general, self.tracks
-        result = general.track(image, persist=True, tracker=self.tracker,
-                               classes=self.selected_classes, imgsz=self.profile.get("track_size", self.args.imgsz), conf=0.15,
-                               verbose=False, device="cpu")[0]
-        detections = []
-        for box in result.boxes:
-            label = general.names[int(box.cls.item())]
-            coords = [round(v, 1) for v in box.xyxy[0].tolist()]
-            confidence = round(float(box.conf.item()), 4)
-            track_id = int(box.id.item()) if box.id is not None else None
-            public_id = self.person_ids.resolve(self.source_hash, track_id) if label == "person" and track_id is not None else track_id
-            color = clothing_color(image, coords) if label == "person" else None
-            detection = {"class": label, "conf": confidence, "box": coords,
-                         "id": public_id, "color": color, "weapon": False}
-            detections.append(detection)
-            if track_id is not None:
-                track = tracks.setdefault(track_id, {"id": public_id, "class": label,
-                    "first_seen": source_time, "last_seen": source_time,
-                    "color": color, "frames": 0, "conf": confidence, "snapshot_score": 0})
-                track.update(last_seen=source_time, frames=track["frames"]+1,
-                             color=color or track["color"], conf=confidence)
-                if label == "person":
-                    left, top, right, bottom = map(int, coords)
-                    h, w = image.shape[:2]
-                    quality = confidence * math.sqrt(max(0, right-left)*max(0, bottom-top))
-                    if left <= 2 or right >= w-2 or top <= 2 or bottom >= h-2:
-                        quality *= .6
-                    if quality > track["snapshot_score"]:
-                        px, py = max(4, (right-left)//12), max(4, (bottom-top)//20)
-                        crop = image[max(0, top-py):min(h, bottom+py), max(0, left-px):min(w, right+px)]
-                        if crop.size:
-                            cv2.imwrite(str(self.evidence / f"person-{public_id}.jpg"), crop,
-                                        [cv2.IMWRITE_JPEG_QUALITY, 92])
-                            track.update(snapshot_score=quality, snapshot_time=round(source_time, 4),
-                                         snapshot_url=f"/api/people/{public_id}/snapshot.jpg")
-        people = [d for d in detections if d["class"] == "person"]
-        self.rejected = []
-        profile = self.profile
-        if len(people) > self.profile.get("max_people", len(people)):
-            # Crowds use the CCTV thresholds at this camera's inference sizes.
-            profile = {**CCTV_PROFILE, **{k: v for k, v in self.profile.items() if k in SIZE_KEYS}}
-        self.active_profile = profile
-        weapon_dets = detect_weapons(self.weapon, image, people, self.weapon_classes, self.args.weapon_conf,
-                                     profile, self.rejected)
-        weapon_dets = associate_hands(self.pose, self.weapon, image, weapon_dets, people,
-                                     self.weapon_classes, self.args.weapon_conf,
-                                     [d for t, d in self.previous_weapons if source_time-t <= hold],
-                                     profile, self.rejected)
-        self.previous_weapons = [(t,d) for t,d in self.previous_weapons if source_time-t <= hold]
-        self.previous_weapons.extend((source_time,d) for d in weapon_dets)
-        strongest = {}
-        for det in weapon_dets:
-            key = (det["class"], det.get("person_id"))
-            detections.append(det)
-            if key not in strongest or det["conf"] > strongest[key]["conf"]:
-                strongest[key] = det
-        for key, det in strongest.items():
-            kind = det["class"]
-            active = self.active_weapons.get(key)
-            if active is None or source_time - active["last"] > 5.0:
-                pending = self.pending_weapons.get(key)
-                if pending is None or source_time - pending["last"] > gap:
-                    pending = {"time": source_time, "last": source_time,
-                               "det": dict(det), "image": image.copy(), "count": 1}
-                    self.pending_weapons[key] = pending
-                else:
-                    pending["last"] = source_time
-                    pending["count"] += 1
-                # Require repeated observations of the same class and holder.
-                # Moving hands can shift the small box between samples.
-                if pending["count"] < (profile["knife_observations"] if kind == "knife" else 2):
-                    continue
-                first = pending["det"]
-                eid = f"{self.fingerprint[:16]}-{kind}-{len(self.events)+1}"
-                evidence_file = f"{eid}.jpg"
-                annotated = pending["image"]
-                x1, y1, x2, y2 = map(int, first["box"])
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (80, 55, 245), 3)
-                cv2.putText(annotated, f"{kind.upper()} {first['conf']:.0%}",
-                            (max(5, x1), max(24, y1-8)), cv2.FONT_HERSHEY_SIMPLEX,
-                            .7, (80, 55, 245), 2)
-                cv2.imwrite(str(self.evidence / evidence_file), annotated)
-                event = {"id": eid, "camera": self.camera["id"], "filename": self.camera["filename"],
-                         "class": kind, "type": f"{kind.title()} detected", "severity": "CRITICAL",
-                         "time": round(pending["time"], 4), "end": round(source_time, 4),
-                         "conf": first["conf"], "box": first["box"], "person_id": first.get("person_id"), "evidence_file": evidence_file,
-                         "snapshot_url": f"/api/evidence/{eid}.jpg"}
-                self.events.append(event)
-                self.active_weapons[key] = {"last": source_time, "event": event}
-                self.pending_weapons.pop(key, None)
-            else:
-                active["last"] = source_time
-                active["event"]["end"] = round(source_time, 4)
-        return detections
-
-
-LIVE_CAMERA_ID = "CAM-LIVE"
-
-
-class LiveCamera:
-    """Analyze webcam frames sent by the browser with the recorded-camera pipeline."""
-
-    def __init__(self, library):
-        self.library = library
-        self.lock = threading.Lock()
-        self.models = None
-        self.processor = None
-        self.session_start = 0.0
-        self.frames = []
-        self.last_thumbnail = 0.0
-        self.last_score_log = 0.0
-        self.camera = {"id": LIVE_CAMERA_ID, "name": "Webcam", "filename": "webcam", "live": True,
-                       "status": "queued", "error": None, "fps": 0, "duration": 0,
-                       "width": 1280, "height": 720, "progress": 0, "samples": 0, "weapon_events": 0,
-                       "video_url": None, "analysis_url": f"/api/cameras/{LIVE_CAMERA_ID}/analysis",
-                       "thumbnail_url": f"/api/cameras/{LIVE_CAMERA_ID}/thumbnail.jpg"}
-
-    @property
-    def thumbnail(self):
-        return self.library.cache / f"{LIVE_CAMERA_ID}-thumbnail.jpg"
-
-    def load(self):
-        """Load independent model instances; recorded analysis runs concurrently."""
-        try:
-            import cv2
-            import numpy as np
-            from ultralytics import YOLO
-
-            if not self.thumbnail.exists():
-                placeholder = np.full((360, 640, 3), 24, np.uint8)
-                cv2.putText(placeholder, "LIVE WEBCAM", (190, 190), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.1, (200, 200, 200), 2)
-                cv2.imwrite(str(self.thumbnail), placeholder)
-            args = self.library.args
-            general, weapon, pose = YOLO(args.model), YOLO(args.weapon_model), YOLO(args.pose_model)
-            wanted = set(getattr(args, "live_weapons", "knife").split(","))
-            weapon_classes = {int(i): weapon_kind(label) for i, label in weapon.names.items()
-                              if weapon_kind(label) in wanted}
-            if not weapon_classes:
-                raise ValueError(f"--live-weapons {','.join(sorted(wanted))} matches no weapon model class")
-            knife_path = Path(getattr(args, "knife_model", "") or "")
-            knife_class = next((i for i, kind in weapon_classes.items() if kind == "knife"), None)
-            if knife_path.is_file() and knife_class is not None:
-                weapon = KnifeAugmentedModel(weapon, YOLO(str(knife_path)), knife_class)
-                print(f"{LIVE_CAMERA_ID} knives: {knife_path.name}", flush=True)
-            tracker = args.tracker
-            tracker_path = Path(tracker)
-            if tracker_path.is_file():
-                import yaml
-                config = yaml.safe_load(tracker_path.read_text(encoding="utf-8"))
-                if config.get("tracker_type") == "botsort" and config.get("with_reid"):
-                    config["proximity_thresh"] = .35
-                    config["model"] = str(ROOT / "yolo26n-cls.pt")
-                    tracker = str(self.library.cache / f"{LIVE_CAMERA_ID}-tracker.yaml")
-                    Path(tracker).write_text(yaml.safe_dump(config), encoding="utf-8")
-            self.models = (general, weapon, weapon_classes, pose, tracker)
-            with self.library.lock:
-                self.camera.update(status="ready", progress=100, error=None)
-            print(f"{LIVE_CAMERA_ID} ready: webcam frames are analyzed live", flush=True)
-        except Exception as exc:
-            with self.library.lock:
-                self.camera.update(status="error", error=f"{type(exc).__name__}: {exc}")
-            print(f"{LIVE_CAMERA_ID} unavailable: {exc}", flush=True)
-
-    def start_session(self):
-        """Begin a new webcam session: fresh tracker state and person IDs."""
-        with self.lock:
-            self.processor = None
-            self.frames = []
-            self.session_start = time.monotonic()
-        return self.status()
-
-    def status(self):
-        with self.library.lock:
-            return {k: v for k, v in self.camera.items()}
-
-    def analyze(self, payload):
-        """Run the full pipeline on one JPEG frame. Returns None while busy."""
-        import cv2
-        import numpy as np
-
-        if self.models is None:
-            raise ValueError("Live detection models are not loaded yet")
-        image = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("Frame is not a decodable image")
-        if not self.lock.acquire(blocking=False):
-            return None
-        try:
-            general, weapon, weapon_classes, pose, tracker = self.models
-            if self.processor is None:
-                session = f"live-{time.time_ns()}"
-                general.predictor = None  # Fresh tracker state for each webcam session.
-                self.session_start = time.monotonic()
-                self.processor = FrameProcessor(
-                    self.camera, general, weapon, weapon_classes, pose, tracker,
-                    self.library.args, self.library.person_ids, self.library.evidence, session,
-                    hashlib.sha256(session.encode()).hexdigest(), adaptive=True,
-                    profile={**WEBCAM_PROFILE, "knife_conf": getattr(self.library.args, "live_knife_conf",
-                                                                     WEBCAM_PROFILE["knife_conf"])})
-            processor = self.processor
-            source_time = time.monotonic() - self.session_start
-            known = len(processor.events)
-            if isinstance(weapon, KnifeAugmentedModel):
-                weapon.best_knife = 0.0
-            detections = processor.process(image, source_time)
-            best_knife = round(weapon.best_knife, 4) if isinstance(weapon, KnifeAugmentedModel) else None
-            if best_knife is not None and best_knife >= .1 and time.monotonic() - self.last_score_log >= 1:
-                needed = processor.active_profile["knife_conf"]
-                print(f"{LIVE_CAMERA_ID} {source_time:6.1f}s best knife score {best_knife:.0%} (needs {needed:.0%})", flush=True)
-                self.last_score_log = time.monotonic()
-            # Live playback cannot retroactively hide unconfirmed candidates, so
-            # only weapons belonging to a confirmed, ongoing event are shown.
-            detections = [d for d in detections if not d["weapon"] or any(
-                e["class"] == d["class"] and e.get("person_id") == d.get("person_id")
-                and e["time"] <= source_time <= e["end"] + .0001 for e in processor.events)]
-            frame = {"time": round(source_time, 4), "dets": detections}
-            # Weapons seen this frame that still need repeated observations.
-            pending = [{"class": kind, "conf": p["det"]["conf"], "count": p["count"],
-                        "needed": processor.active_profile["knife_observations"] if kind == "knife" else 2}
-                       for (kind, _), p in processor.pending_weapons.items() if p["last"] == source_time]
-            rejected = [{"class": kind, "conf": round(conf, 4), "reason": reason}
-                        for kind, conf, reason in processor.rejected]
-            for item in sorted(rejected, key=lambda r: -r["conf"])[:3]:
-                print(f"{LIVE_CAMERA_ID} {source_time:6.1f}s {item['class']} {item['conf']:.0%} "
-                      f"ignored: {item['reason']}", flush=True)
-            self.frames = (self.frames + [frame])[-3600:]
-            height, width = image.shape[:2]
-            if time.monotonic() - self.last_thumbnail > 5:
-                cv2.imwrite(str(self.thumbnail), image)
-                self.last_thumbnail = time.monotonic()
-            tracks = [{k: v for k, v in t.items() if k != "snapshot_score"}
-                      for t in processor.tracks.values()]
-            with self.library.lock:
-                self.camera.update(width=width, height=height, samples=self.camera["samples"]+1,
-                                   weapon_events=self.camera["weapon_events"]+len(processor.events)-known)
-                self.library.analyses[LIVE_CAMERA_ID] = {
-                    "camera": LIVE_CAMERA_ID, "fingerprint": processor.fingerprint,
-                    "sample_fps": self.library.args.analysis_fps, "live": True,
-                    "frames": self.frames, "events": processor.events, "tracks": tracks}
-            return {**frame, "camera": LIVE_CAMERA_ID, "width": width, "height": height,
-                    "new_events": [dict(e) for e in processor.events[known:]], "tracks": tracks,
-                    "pending": pending, "rejected": rejected, "best_knife": best_knife,
-                    "knife_conf": processor.active_profile["knife_conf"]}
-        finally:
-            self.lock.release()
-
-
 class CameraLibrary:
     def __init__(self, args):
         import cv2
@@ -695,19 +407,18 @@ class CameraLibrary:
             cap.release()
             self.cameras[cid] = camera
         json_write(camera_path, camera_ids)
-        self.live = LiveCamera(self) if getattr(args, "webcam", True) else None
-        if self.live:
-            self.cameras[LIVE_CAMERA_ID] = self.live.camera
-        # Keep real, persisted evidence only for the videos currently installed.
+        from live_webcam import WebcamEngine
+        self.webcam = WebcamEngine(self)
+        # Keep persisted live evidence and the installed recorded sources.
         self.incidents = [e for e in self.incidents
-                          if e.get("camera") in self.cameras and
-                          e.get("filename") == self.cameras[e["camera"]]["filename"]]
+                          if e.get("source_type") == "webcam" or (e.get("camera") in self.cameras and
+                          e.get("filename") == self.cameras[e["camera"]]["filename"])]
 
     def catalog(self):
+        self.webcam.expire()
         with self.lock:
             return {"cameras": [{k: v for k, v in c.items() if k != "path"}
                                 for c in self.cameras.values()],
-                    "live_camera": LIVE_CAMERA_ID if self.live else None,
                     "capabilities": self.capabilities, "model_error": self.model_error,
                     "sample_fps": self.args.analysis_fps,
                     "weapon_conf": self.args.weapon_conf,
@@ -729,8 +440,6 @@ class CameraLibrary:
 
     def start(self):
         threading.Thread(target=self.analyze_all, daemon=True, name="video-analysis").start()
-        if self.live:
-            threading.Thread(target=self.live.load, daemon=True, name="live-models").start()
 
     def analyze_all(self):
         try:
@@ -748,10 +457,12 @@ class CameraLibrary:
                 raise ValueError("Weapon model must include both gun/pistol and knife classes; "
                                  f"found {weapon.names}")
             print(f"Weapon classes: {weapon.names}; analyzing at {self.args.analysis_fps:g} FPS", flush=True)
-            for camera in self.cameras.values():
+            for camera in list(self.cameras.values()):
+                if camera.get("source_type") == "webcam":
+                    continue
                 if self.stop.is_set():
                     break
-                if camera["status"] == "error" or camera.get("live"):
+                if camera["status"] == "error":
                     continue
                 try:
                     self.analyze_camera(camera, general, weapon, weapon_classes, pose)
@@ -762,8 +473,10 @@ class CameraLibrary:
         except Exception as exc:
             with self.lock:
                 self.model_error = f"{type(exc).__name__}: {exc}"
-                for camera in self.cameras.values():
-                    if camera["status"] != "error" and not camera.get("live"):
+                for camera in list(self.cameras.values()):
+                    if camera.get("source_type") == "webcam":
+                        continue
+                    if camera["status"] != "error":
                         camera.update(status="error", error=self.model_error)
             print(f"Analysis unavailable: {self.model_error}", flush=True)
 
@@ -817,11 +530,13 @@ class CameraLibrary:
                 Path(tracker).write_text(yaml.safe_dump(config), encoding="utf-8")
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         sample_step = 1 / self.args.analysis_fps
-        frames = []
-        processor = FrameProcessor(camera, general, weapon, weapon_classes, pose, tracker,
-                                   self.args, self.person_ids, self.evidence, source_hash, fingerprint)
-        events, tracks = processor.events, processor.tracks
+        frames, events, tracks = [], [], {}
+        active_weapons = {}
+        previous_weapons = []
+        pending_weapons = {}
         frame_number, next_sample = 0, 0.0
+        selected_classes = [i for i, name in general.names.items()
+                            if name in ("person", "backpack", "handbag", "suitcase")]
         try:
             while not self.stop.is_set():
                 ok = cap.grab()
@@ -835,7 +550,90 @@ class CameraLibrary:
                 if not ok:
                     break
                 next_sample += sample_step
-                detections = processor.process(image, source_time)
+                result = general.track(image, persist=True, tracker=tracker,
+                                       classes=selected_classes, imgsz=self.args.imgsz, conf=0.15,
+                                       verbose=False, device="cpu")[0]
+                detections = []
+                for box in result.boxes:
+                    label = general.names[int(box.cls.item())]
+                    coords = [round(v, 1) for v in box.xyxy[0].tolist()]
+                    confidence = round(float(box.conf.item()), 4)
+                    track_id = int(box.id.item()) if box.id is not None else None
+                    public_id = self.person_ids.resolve(source_hash, track_id) if label == "person" and track_id is not None else track_id
+                    color = clothing_color(image, coords) if label == "person" else None
+                    detection = {"class": label, "conf": confidence, "box": coords,
+                                 "id": public_id, "color": color, "weapon": False}
+                    detections.append(detection)
+                    if track_id is not None:
+                        track = tracks.setdefault(track_id, {"id": public_id, "class": label,
+                            "first_seen": source_time, "last_seen": source_time,
+                            "color": color, "frames": 0, "conf": confidence, "snapshot_score": 0})
+                        track.update(last_seen=source_time, frames=track["frames"]+1,
+                                     color=color or track["color"], conf=confidence)
+                        if label == "person":
+                            left, top, right, bottom = map(int, coords)
+                            h, w = image.shape[:2]
+                            quality = confidence * math.sqrt(max(0, right-left)*max(0, bottom-top))
+                            if left <= 2 or right >= w-2 or top <= 2 or bottom >= h-2:
+                                quality *= .6
+                            if quality > track["snapshot_score"]:
+                                px, py = max(4, (right-left)//12), max(4, (bottom-top)//20)
+                                crop = image[max(0, top-py):min(h, bottom+py), max(0, left-px):min(w, right+px)]
+                                if crop.size:
+                                    cv2.imwrite(str(self.evidence / f"person-{public_id}.jpg"), crop,
+                                                [cv2.IMWRITE_JPEG_QUALITY, 92])
+                                    track.update(snapshot_score=quality, snapshot_time=round(source_time, 4),
+                                                 snapshot_url=f"/api/people/{public_id}/snapshot.jpg")
+                people = [d for d in detections if d["class"] == "person"]
+                weapon_dets = detect_weapons(weapon, image, people, weapon_classes, self.args.weapon_conf)
+                weapon_dets = associate_hands(pose, weapon, image, weapon_dets, people,
+                                             weapon_classes, self.args.weapon_conf,
+                                             [d for t, d in previous_weapons if source_time-t <= .4])
+                previous_weapons = [(t,d) for t,d in previous_weapons if source_time-t <= .4]
+                previous_weapons.extend((source_time,d) for d in weapon_dets)
+                strongest = {}
+                for det in weapon_dets:
+                    key = (det["class"], det.get("person_id"))
+                    detections.append(det)
+                    if key not in strongest or det["conf"] > strongest[key]["conf"]:
+                        strongest[key] = det
+                for key, det in strongest.items():
+                    kind = det["class"]
+                    active = active_weapons.get(key)
+                    if active is None or source_time - active["last"] > 5.0:
+                        pending = pending_weapons.get(key)
+                        if pending is None or source_time - pending["last"] > .6 :
+                            pending = {"time": source_time, "last": source_time,
+                                       "det": dict(det), "image": image.copy(), "count": 1}
+                            pending_weapons[key] = pending
+                        else:
+                            pending["last"] = source_time
+                            pending["count"] += 1
+                        # Require repeated observations of the same class and holder.
+                        # Moving hands can shift the small box between samples.
+                        if pending["count"] < (3 if kind == "knife" else 2):
+                            continue
+                        first = pending["det"]
+                        eid = f"{fingerprint[:16]}-{kind}-{len(events)+1}"
+                        evidence_file = f"{eid}.jpg"
+                        annotated = pending["image"]
+                        x1, y1, x2, y2 = map(int, first["box"])
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (80, 55, 245), 3)
+                        cv2.putText(annotated, f"{kind.upper()} {first['conf']:.0%}",
+                                    (max(5, x1), max(24, y1-8)), cv2.FONT_HERSHEY_SIMPLEX,
+                                    .7, (80, 55, 245), 2)
+                        cv2.imwrite(str(self.evidence / evidence_file), annotated)
+                        event = {"id": eid, "camera": camera["id"], "filename": camera["filename"],
+                                 "class": kind, "type": f"{kind.title()} detected", "severity": "CRITICAL",
+                                 "time": round(pending["time"], 4), "end": round(source_time, 4),
+                                 "conf": first["conf"], "box": first["box"], "person_id": first.get("person_id"), "evidence_file": evidence_file,
+                                 "snapshot_url": f"/api/evidence/{eid}.jpg"}
+                        events.append(event)
+                        active_weapons[key] = {"last": source_time, "event": event}
+                        pending_weapons.pop(key, None)
+                    else:
+                        active["last"] = source_time
+                        active["event"]["end"] = round(source_time, 4)
                 frames.append({"time": round(source_time, 4), "dets": detections})
                 with self.lock:
                     camera.update(progress=min(99, round(source_time / camera["duration"] * 100)),
@@ -895,35 +693,6 @@ class CameraLibrary:
                 updated.append(incident)
         self.incidents = updated
         json_write(self.incident_path, self.incidents)
-
-    def delete_incident(self, incident_id):
-        """Remove an incident. A webcam snapshot is deleted with it; a recorded
-        camera's snapshot is kept because the video analysis cache needs it."""
-        with self.lock:
-            incident = next((e for e in self.incidents if e["id"] == incident_id), None)
-            if incident is None:
-                raise KeyError("Unknown incident")
-            self.incidents = [e for e in self.incidents if e["id"] != incident_id]
-            json_write(self.incident_path, self.incidents)
-            camera = self.cameras.get(incident.get("camera"), {})
-            removed_file = False
-            if camera.get("live"):
-                live = self.analyses.get(incident["camera"])
-                if live:
-                    live["events"][:] = [e for e in live["events"] if e["id"] != incident_id]
-                name = incident.get("evidence_file", "")
-                if re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", name):
-                    path = self.evidence / name
-                    if path.exists():
-                        path.unlink()
-                        removed_file = True
-            return {"deleted": incident_id, "snapshot_deleted": removed_file}
-
-    def delete_all_incidents(self):
-        """Delete every incident, with the same snapshot rules as delete_incident."""
-        with self.lock:
-            results = [self.delete_incident(e["id"]) for e in list(self.incidents)]
-        return {"deleted": len(results), "snapshots_deleted": sum(r["snapshot_deleted"] for r in results)}
 
     def activate(self, cid, event_id):
         with self.lock:
@@ -1002,6 +771,115 @@ def make_video_handler(library):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def gemini_chat(self, question):
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                return self.reply(503, {"error": "Set GEMINI_API_KEY in the server environment or .env file to enable the assistant."})
+
+            with library.lock:
+                analyses = list(library.analyses.items())
+                incidents = list(library.incidents)
+            incidents_by_id = {incident.get("id"): incident for incident in incidents}
+
+            records = []
+            seen_people = set()
+            seen_events = set()
+            for camera_id, analysis in analyses:
+                for track in analysis.get("tracks", []):
+                    person_id = track.get("id")
+                    if track.get("class") != "person" or not re.fullmatch(r"P-\d{4,}", str(person_id)) or person_id in seen_people:
+                        continue
+                    seen_people.add(person_id)
+                    records.append({
+                        "kind": "person", "id": person_id, "camera": camera_id,
+                        "color": track.get("color"), "first_seen": track.get("first_seen"),
+                        "last_seen": track.get("last_seen"), "snapshot_time": track.get("snapshot_time"),
+                        "path": library.evidence / f"person-{person_id}.jpg",
+                        "url": f"/api/people/{person_id}/snapshot.jpg",
+                    })
+                for event in analysis.get("events", []):
+                    evidence_name = event.get("evidence_file")
+                    if not evidence_name or not re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", evidence_name):
+                        continue
+                    event_id = event.get("id")
+                    if event_id in seen_events:
+                        continue
+                    seen_events.add(event_id)
+                    saved_incident = incidents_by_id.get(event_id, {})
+                    records.append({
+                        "kind": "incident", "id": event_id, "camera": camera_id,
+                        "type": saved_incident.get("type", event.get("type")),
+                        "severity": saved_incident.get("severity", event.get("severity", "CRITICAL")),
+                        "status": saved_incident.get("status", "Detected"),
+                        "time": event.get("time"), "person_id": event.get("person_id"),
+                        "path": library.evidence / evidence_name,
+                        "url": f"/api/evidence/{evidence_name}",
+                    })
+            for incident in incidents:
+                evidence_name = incident.get("evidence_file")
+                if not evidence_name or not re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", evidence_name):
+                    continue
+                if incident.get("id") in seen_events:
+                    continue
+                seen_events.add(incident.get("id"))
+                records.append({
+                    "kind": "incident", "id": incident.get("id"), "camera": incident.get("camera"),
+                    "type": incident.get("type"), "severity": incident.get("severity"), "status": incident.get("status"),
+                    "time": incident.get("time"), "person_id": incident.get("person_id"),
+                    "path": library.evidence / evidence_name,
+                    "url": f"/api/evidence/{evidence_name}",
+                })
+
+            people = [record for record in records if record["kind"] == "person"]
+            events = [record for record in records if record["kind"] == "incident"]
+            records = [group[index] for index in range(max(len(people), len(events)))
+                       for group in (people, events) if index < len(group)]
+            record_data = [{key: value for key, value in record.items() if key not in ("path", "url")} for record in records]
+            prompt = (
+                "Answer in the same language as the user's question. Use only the provided camera records and images; "
+                "never guess a person's identity or details. Distinguish recorded metadata from visual observations, "
+                "state when an image is unclear, and cite person IDs, camera IDs, and source times when relevant. "
+                "Clothing colors are approximate automated metadata. Times are seconds from the recorded clip; "
+                "no wall-clock recording time is available, so do not infer one. A detected weapon event is a model alert, not proof of intent.\n"
+                f"User question: {question}\nCamera records (JSON): {json.dumps(record_data, ensure_ascii=False)}"
+            )
+            parts = [{"text": prompt}]
+            attached = []
+            for record in records:
+                if len(attached) >= 12 or not record["path"].is_file():
+                    continue
+                try:
+                    image = record["path"].read_bytes()
+                except OSError:
+                    continue
+                if len(image) > 4 * 1024 * 1024:
+                    continue
+                label = f"{record['kind']} {record['id']} from {record['camera']}"
+                parts.extend(({"text": f"Snapshot: {label}"}, {
+                    "inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image).decode("ascii")}
+                }))
+                attached.append({"kind": record["kind"], "id": record["id"], "camera": record["camera"], "url": record["url"]})
+
+            model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent"
+            payload = json.dumps({"contents": [{"role": "user", "parts": parts}]}).encode()
+            request = Request(endpoint, data=payload, headers={
+                "Content-Type": "application/json", "x-goog-api-key": api_key
+            }, method="POST")
+            try:
+                with urlopen(request, timeout=45) as response:
+                    response_body = response.read(1_000_001)
+                if len(response_body) > 1_000_000:
+                    raise ValueError("Gemini response exceeded the size limit")
+                result = json.loads(response_body)
+                answer = "".join(part.get("text", "") for part in result["candidates"][0]["content"]["parts"])
+                if not answer:
+                    raise ValueError("Gemini returned an empty response")
+            except (HTTPError, URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                detail = getattr(exc, "reason", None) or str(exc)
+                return self.reply(502, {"error": f"Gemini request failed: {detail}"})
+            return self.reply(200, {"answer": answer, "images": attached})
+
         def do_HEAD(self):
             self.do_GET()
 
@@ -1010,10 +888,14 @@ def make_video_handler(library):
             path = url.path
             if path in ("/", "/raqeeb.html"):
                 return self.file(ROOT / "raqeeb.html", "text/html; charset=utf-8")
+            if path == "/sentinelops-dashboard.html":
+                return self.file(ROOT / "sentinelops-dashboard.html", "text/html; charset=utf-8")
             if path == "/app.js":
                 return self.file(ROOT / "app.js", "text/javascript; charset=utf-8")
-            if path in ("/ui.css", "/dashboard-ui.js"):
+            if path in ("/ui.css", "/dashboard-ui.js", "/webcam.js", "/site-map-tracking.js", "/site-map-3d.js"):
                 return self.file(ROOT / path[1:], "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8")
+            if path == "/site_map.json":
+                return self.file(ROOT / "site_map.json", "application/json; charset=utf-8")
             if path in ("/api/cameras", "/api/state"):
                 return self.reply(200, library.catalog())
             if path == "/api/incidents":
@@ -1033,8 +915,8 @@ def make_video_handler(library):
                 if camera is None:
                     return self.reply(404, {"error": "Unknown camera"})
                 if action == "video":
-                    if camera.get("live"):
-                        return self.reply(404, {"error": "The webcam streams from the browser"})
+                    if camera.get("source_type") == "webcam":
+                        return self.reply(400, {"error": "Live webcams do not have recorded video playback"})
                     return self.file(camera["path"])
                 if action == "thumbnail.jpg":
                     return self.file(library.cache / f"{cid}-thumbnail.jpg", "image/jpeg")
@@ -1056,57 +938,35 @@ def make_video_handler(library):
 
         def do_OPTIONS(self):
             return self.reply(204, b"", headers={"Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type"})
-
-        def live_frame(self, length):
-            live = getattr(library, "live", None)
-            if live is None:
-                return self.reply(404, {"error": "Webcam disabled"})
-            if length <= 0 or length > 8 * 1024 * 1024:
-                return self.reply(400, {"error": "Invalid frame size"})
-            result = live.analyze(self.rfile.read(length))
-            if result is None:
-                return self.reply(409, {"error": "Previous webcam frame is still being analyzed"})
-            return self.reply(200, result)
-
-        def training_photo(self, label, length):
-            """Save a webcam frame locally under runtime/training/<label>/ (never uploaded)."""
-            if length <= 0 or length > 8 * 1024 * 1024:
-                return self.reply(400, {"error": "Invalid photo size"})
-            data = self.rfile.read(length)
-            if not data.startswith(b"\xff\xd8"):
-                return self.reply(400, {"error": "Photo must be a JPEG"})
-            root = library.runtime / "training"
-            folder = root / label
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}.jpg").write_bytes(data)
-            counts = {name: len(list((root / name).glob("*.jpg"))) if (root / name).is_dir() else 0
-                      for name in ("knife", "none")}
-            return self.reply(200, {"saved": label, "counts": counts, "folder": str(root)})
+                "Access-Control-Allow-Headers": "Content-Type, X-Webcam-Session"})
 
         def do_POST(self):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                training = re.fullmatch(r"/api/live/training/(knife|none)", self.path)
-                if training:
-                    return self.training_photo(training.group(1), length)
-                if self.path == "/api/live/frame":
-                    return self.live_frame(length)
-                if self.path == "/api/live/start":
-                    live = getattr(library, "live", None)
-                    return self.reply(200, live.start_session()) if live else self.reply(404, {"error": "Webcam disabled"})
+                if self.path == "/api/webcam/frame":
+                    from live_webcam import MAX_FRAME_BYTES
+                    if length <= 0 or length > MAX_FRAME_BYTES:
+                        return self.reply(413, {"error": "Invalid webcam frame size"})
+                    if self.headers.get("Content-Type", "").split(";")[0] != "image/jpeg":
+                        return self.reply(415, {"error": "Webcam frames must be JPEG images"})
+                    return self.reply(200, library.webcam.process(
+                        self.headers.get("X-Webcam-Session"), self.rfile.read(length)))
                 if length <= 0 or length > 16384:
                     return self.reply(400, {"error": "Invalid request size"})
                 data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    return self.reply(400, {"error": "Expected a JSON object"})
+                if self.path == "/api/chat":
+                    question = data.get("message")
+                    if not isinstance(question, str) or not question.strip() or len(question) > 2000:
+                        return self.reply(400, {"error": "Message must be between 1 and 2000 characters."})
+                    return self.gemini_chat(question.strip())
+                if self.path == "/api/webcam/start":
+                    return self.reply(200, library.webcam.start())
+                if self.path == "/api/webcam/stop":
+                    return self.reply(200, library.webcam.stop(data.get("session")))
                 if self.path == "/api/incidents":
                     return self.reply(200, library.activate(data["camera"], data["event_id"]))
-                if self.path == "/api/incidents/delete-all":
-                    return self.reply(200, library.delete_all_incidents())
-                if self.path == "/api/incidents/delete":
-                    try:
-                        return self.reply(200, library.delete_incident(data["id"]))
-                    except KeyError:
-                        return self.reply(404, {"error": "Unknown incident"})
                 if self.path == "/api/incidents/status":
                     if data["status"] not in ("New", "Under Review", "Investigating", "Confirmed", "False Positive", "Resolved"):
                         raise ValueError("Invalid status")
@@ -1119,7 +979,10 @@ def make_video_handler(library):
                     return self.reply(200, incident)
                 return self.reply(404, {"error": "Not found"})
             except (ValueError, KeyError, TypeError) as exc:
-                return self.reply(400, {"error": str(exc)})
+                return self.reply(getattr(exc, "status", 400), {"error": str(exc)})
+            except Exception as exc:
+                print(f"Request failed: {type(exc).__name__}: {exc}", flush=True)
+                return self.reply(503, {"error": "Webcam processing unavailable. Check the server log."})
     return Handler
 
 
@@ -1128,13 +991,18 @@ def serve_video_cameras(args):
         raise ValueError("--analysis-fps must be between 1 and 30")
     if not 0 < args.weapon_conf <= 1:
         raise ValueError("--weapon-conf must be between 0 and 1")
+    live_knife_conf = getattr(args, "live_knife_conf", WEBCAM_PROFILE["knife_conf"])
+    if not math.isfinite(live_knife_conf) or not 0 < live_knife_conf <= 1:
+        raise ValueError("--live-knife-conf must be between 0 and 1")
+    live_weapons = {name.strip().lower() for name in
+                    str(getattr(args, "live_weapons", "knife")).split(",") if name.strip()}
+    if not live_weapons or not live_weapons.issubset({"gun", "knife"}):
+        raise ValueError("--live-weapons must contain gun, knife, or both")
     library = CameraLibrary(args)
     server = ThreadingHTTPServer((args.host, args.port), make_video_handler(library))
     server.daemon_threads = True
     library.start()
-    recorded = sum(not c.get("live") for c in library.cameras.values())
-    print(f"Raqeeb: http://{args.host}:{args.port} — {recorded} recorded cameras"
-          f"{' + live webcam (' + LIVE_CAMERA_ID + ')' if library.live else ''}", flush=True)
+    print(f"Raqeeb: http://{args.host}:{args.port} — {len(library.cameras)} recorded cameras", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

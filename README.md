@@ -30,18 +30,6 @@ The server discovers video files recursively in `examples/` and `samples/`. Each
 
 Sources are labeled **RECORDED SOURCE**. There are no generated camera feeds, scripted incidents, random demo timers, simulated network logs, or fabricated analytics. Videos play muted and loop at their native frame rate. Other dashboard pages use these same camera sources, person tracks, and saved incidents.
 
-## Live webcam (CAM-LIVE)
-
-A **CAM-LIVE** tile appears next to the recorded cameras. By default the webcam alerts on **knives only**; use `--live-weapons gun,knife` to include guns. Click **Start webcam** on the tile (or **Start monitoring**) and allow camera access. The browser streams webcam frames to the server, and each frame goes through the same pipeline as the recorded cameras: BoT-SORT person tracking with persistent `P-xxxx` IDs, tiled weapon detection, pose-based holder validation, and repeated-observation confirmation. Confirmed gun/knife detections raise the same critical alerts and saved incidents, with an annotated evidence snapshot. Live person tracks appear in People Tracking and Person Search.
-
-- Frames are analyzed as fast as the CPU allows, with one frame in flight at a time (the tile shows seconds per frame). Webcam subjects are close and large, so the webcam sends 640-pixel frames and uses 640-pixel inference without the CCTV magnification tiles: expect roughly 3–4 analyzed frames per second on a 4-core CPU, versus 1.5–2 seconds per frame with the recorded-camera settings. The webcam view itself plays at full frame rate, and boxes glide between analyzed frames. Live inference runs alongside recorded analysis, so it is fastest once the recorded videos are cached. Small, distant weapons are left to the recorded-camera pipeline.
-- Because live frames are sparser than recorded samples, the weapon confirmation windows widen to span consecutive analyzed frames. Only confirmed weapons are boxed on the live view.
-- Webcam knives come from `knife.pt`, a dedicated knife detector fine-tuned from `yolo26n.pt` for close range: Open Images knife photos and knife-free photos of hands, phones, pens, scissors, remotes, and tools; the close-up images (knife at least 20% of the frame) of the OD-WeaponDetection Knife Detection dataset; and labelled webcam photos of a held knife and of empty hands. On held-out data at the 50% webcam threshold it finds 72% of close-up dataset images (previous model: 10%) and 10 of 12 held-out webcam knife frames with 0 of 10 knife-free webcam frames flagged; at 70% the figures are 32% and 6 of 12. It is tuned for close range and is weaker on distant knives and product shots. Pass `--knife-model ""` to use `weapon.pt` instead.
-- A webcam sees people up close, so when at most 3 people are in view the webcam uses close-range validation: knives need a 50% score (recorded cameras: 80%) in 3 consecutive analyzed frames, because a held knife persists across frames while false matches tend to flicker; there is no size or whole-person overlap check, because a held knife can fill the frame and a lone hand can be mistaken for a body; and when the wrist is out of view, a weapon scoring at least 40% is attributed to the nearest person. Crowded frames use the recorded-camera thresholds. Tune the knife threshold with `--live-knife-conf`.
-- The tile footer shows "Checking possible KNIFE …" while a weapon awaits confirmation. The server console prints why a weapon candidate was ignored (for example, below the knife threshold), which helps when an object is not alerted. Weapon detection depends on what `weapon.pt` recognizes; hold the knife clearly, blade visible, with good lighting.
-- Each **Start webcam** begins a new session with fresh tracking. Source times on live incidents are seconds since the session started; `detected_at` holds the wall-clock time.
-- Browsers allow webcam access only on `localhost` or HTTPS, so open the dashboard at http://localhost:8000. Use `--no-webcam` to hide the tile.
-
 ## Recognition and alerts
 
 - `yolo26n.pt` detects people and bags at 1280-pixel inference resolution. BoT-SORT uses motion and appearance features, with a longer track buffer, to retain person tracks through brief misses and occlusions.
@@ -53,10 +41,10 @@ A **CAM-LIVE** tile appears next to the recorded cameras. By default the webcam 
 - Weapon alerts include the associated anonymous person ID. Critical/high/medium/low severities have prominent distinct colors throughout notifications and review.
 - A weapon box that substantially duplicates an independently detected whole person is rejected as a class confusion. A continuous weapon appearance produces one incident rather than a popup every frame.
 - Alerts include the camera, source timestamp, confidence, and an actual annotated source-frame snapshot. Incidents and their review status persist in `runtime/incidents.json`; snapshots live in `runtime/evidence/`.
-- **Delete** (Evidence library cards and the evidence popup) removes an incident after confirmation; **Delete all** in the Evidence library header removes every incident, including archived false positives. For the live webcam it also deletes the snapshot, which cannot be recovered. For recorded cameras the snapshot file is kept because the video's analysis cache needs it, and the alert can reappear if that footage is replayed.
 - Unsupported alerts from older analyses are archived as False Positive, preserving review history. They are excluded from live activity and notifications.
 - Each weapon appearance alerts once per browser session. **Restart footage** rearms popups without duplicating saved incidents. The footage continues playing while an operator reviews an alert.
-- Person Search matches clothing color, camera ID, or track ID from analyzed footage. Clothing colors are approximate, and search results are historical source tracks, not identities.
+- The AI Camera Assistant answers questions about clothing, people, snapshots, incident priority, source times, and detected weapon types using Gemini. Answers link the related person snapshots and incident evidence when available. Clothing colors are approximate metadata; times refer to seconds in a recorded clip, not wall-clock time.
+- To enable the assistant, copy `.env.example` to `.env` and set `GEMINI_API_KEY`; `GEMINI_MODEL` is optional. An existing server environment variable takes precedence, and `.env` is ignored by Git. The key remains on the server. Questions send camera-track/incident metadata and up to 12 snapshots to Google's Gemini API, so only enable this for footage you are permitted to share with Google. Without a key, the assistant reports that it is not configured.
 
 Model scores are not guarantees. A small or briefly visible weapon may be missed, and false positives remain possible. Analysis samples are not every video frame. Tune sampling and confidence when needed:
 
@@ -75,15 +63,16 @@ Changing the models, source files, tracker, analysis resolution, sample rate, or
 | `dashboard-ui.js` | Navigation, metrics, charts, directories, and review layouts |
 | `app.js` | Camera playback, synchronized boxes/alerts, search, and incident review |
 | `server.py` | Server command-line entry point |
-| `video_cameras.py` | Video discovery, shared per-frame YOLO pipeline (recorded and live webcam), evidence, HTTP range streaming, and persistence |
+| `video_cameras.py` | Video discovery, YOLO analysis, evidence, HTTP range streaming, and persistence |
+| `.env.example` | Optional Gemini assistant configuration template |
 | `start_raqeeb.cmd` | Windows launch shortcut |
 | `tracking_cleanup.py` | Fragment consolidation, unique track rows, and stable incident identifiers |
 | `camera_sources.json` | Portable initial camera assignments |
 | `yolo26n-pose.pt` | Wrist and holder validation |
-| `knife.pt` | Dedicated knife detector used by the live webcam |
+| `knife.pt` | Dedicated live close-range knife detector |
 | `person_tracker.yaml` | Appearance-assisted person tracking settings |
 | `yolo26n-cls.pt` | Lightweight appearance encoder used by the tracker |
-| `raqeeb.py` | Separate legacy webcam tracking script; the dashboard's CAM-LIVE tile replaces it |
+| `raqeeb.py` | Separate legacy webcam tracking script; not used by this dashboard |
 | `samples/`, `examples/` | Input video folders (either may be absent) |
 | `tests/test_video_cameras.py` | Incident provenance, persistence, source discovery, and HTTP tests |
 
@@ -116,6 +105,62 @@ Overview and Analytics show real person-track distribution, camera readiness, ob
 
 The browser check captures each screen and verifies chart totals, all-screen mobile layout, Arabic mobile layout, and the existing camera/alert workflow. UI styling is in `ui.css`; reusable presentation components are in `dashboard-ui.js`.
 
-## Credits
+## Live Webcam
 
-`knife.pt` was trained partly on the [OD-WeaponDetection](https://github.com/ari-dasci/OD-WeaponDetection) Knife Detection dataset by Francisco Pérez Hernández, Alberto Castillo Lamas, Siham Tabik, and colleagues (University of Granada), licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), and on [Open Images](https://storage.googleapis.com/openimages/web/index.html) annotations (CC BY 4.0). The training images are not included in this repository.
+Open **Live Webcam** in the sidebar, choose a camera, and click **Start webcam**. Allow the browser's camera permission prompt. The microphone is never requested. Use **Stop webcam** to release the device; closing the page also releases it. Browser camera access requires `localhost` or HTTPS. Recorded CAM-01 and CAM-03 remain available in Live Monitoring.
+
+WEB-01 sends one current JPEG frame at a time to the local backend. Frames are sent and displayed at up to 960 pixels on the long edge. Person tracking and pose inference use a 416-pixel profile; dedicated close-range knife inference remains at 640 pixels. The webcam skips repeated hand-crop weapon inference while retaining wrist-based holder validation, and tracks without the recorded-camera appearance re-identification and camera-motion passes. These webcam optimizations do not change recorded-camera analysis. The close-range profile skips distant-CCTV tile passes. A dedicated `knife.pt` model is used when available. Knife alerts need three observations; the default knife threshold is 50%. The default live alert selection is knives only; pass `--live-weapons gun,knife` to include guns, or use `--live-knife-conf` to tune the threshold. This selection is independent of the recorded-camera weapon settings. Views with more than three people fall back to recorded-camera validation thresholds. The live confirmation window allows CPU processing intervals, and a continuous appearance produces one incident. Inference is not the native preview frame rate; its rate depends on the local hardware.
+
+The **Live preview** shows unprocessed camera video. The **AI detection view** displays the exact analyzed frame with synchronized boxes, measured inference rate, and frame age. The next frame is captured after the current request completes, so frames do not build up in a queue. Live recognition continues when navigating to another dashboard screen until Stop is pressed.
+
+WEB-01 uses global anonymous person IDs independent of camera numbering. Its tracks, screenshots, confirmed live incidents, evidence, and review status appear in the existing People Tracking, Alerts, Incidents, and Evidence pages. Snapshots and track/incident metadata persist under `runtime/`. A new webcam session receives new anonymous track IDs; this does not verify identity across sessions. Continuous webcam video is **not** recorded, so historical live alerts can be reviewed through snapshots, not video replay.
+
+Files: `live_webcam.py` owns token-scoped sessions and inference; it uses the camera profiles and model helpers in `video_cameras.py`. `webcam.js` owns explicit video-only browser capture and the live UI. Only one webcam tab owns the active session. In-flight results are rejected after Stop, and inactive sessions expire after 30 seconds without frames.
+
+### Webcam regression checks
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe tests/make_webcam_fixture.py
+.venv\Scripts\python.exe server.py --port 8002 --runtime-dir runtime/webcam-validation
+```
+
+In another terminal:
+
+```powershell
+$env:WEBCAM_TEST_VIDEO=(Resolve-Path runtime/webcam-test.y4m).Path
+node tests/browser_webcam.mjs
+```
+
+The fixture is generated from the supplied video solely for the browser test. The test explicitly starts Chrome with its test camera flags; the production app has no simulated webcam or fallback feed. It verifies browser capture, actual gun-model inference, alert/evidence creation, person snapshots, cross-screen monitoring, camera release on Stop, permission-denied handling, and mobile/RTL layout. Knife confirmation is covered by unit tests; a physical webcam and a real knife scenario have not been validated in this environment.
+
+Implementation references: [browser camera access](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia), [releasing camera tracks](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack/stop), and [persistent frame-by-frame tracking](https://docs.ultralytics.com/modes/track/).
+
+## Expo 2030 3D map and detection markers
+
+The map from `Y:/Raqeeb-expo2030-3d` is integrated into **Overview**, **Live Monitoring**, and **Live Webcam**, with its existing site geometry and camera placements preserved. `site-map-3d.js` renders the scene locally on a canvas; `site_map.json` contains the editable plan. No external 3D library or build step is required.
+
+- Small blue dots represent people in the current analyzed frame, or the last viewed frame when a recording is paused. The map does not create dots from the full historical person directory. Each anonymous person ID appears once.
+- A person linked to an open incident becomes red and pulses. When that person leaves view, a red incident marker remains at the saved person location. Multiple incidents for the same absent holder share one marker. Resolved and False Positive incidents stop highlighting the person and remove their standalone incident markers.
+- Click a person dot to open its snapshot or review its incident evidence. Open alerts are review state, so red does not assert that a weapon is currently visible in the paused frame.
+- WEB-01 has no assumed site location. Choose its station in **Webcam position** using an existing plan position; this browser's selection persists locally. Unplaced detections are disclosed rather than assigned arbitrary coordinates. Planned camera pins in your original map are planning positions, not added camera feeds.
+- Drag to orbit, scroll or use +/- to zoom, shift-drag to pan, and use the view buttons. Keyboard arrow keys orbit the focused canvas; Home resets the view. Incident pulses respect reduced-motion preferences.
+
+**Placement is camera-relative and approximate**, as selected for this integration. A person's image foot point is projected into the configured camera's heading, field of view, and range. These dots are not measured geographic or calibrated floor locations. A camera can optionally supply `floor_homography`: nine numbers forming a row-major 3x3 matrix mapping normalized image foot points `[u, v, 1]` to site `[x, z, w]`, with the result divided by `w`. Only supply this when you have calibrated that camera against the floor plan.
+
+Paused recordings keep their last observed positions and the HUD identifies them as paused. Stale webcam observations disappear after five seconds, while saved open incidents remain available for review. Offline sources do not generate current person markers. The imported map does not replace any detection, tracking, webcam, or incident-persistence code.
+
+Checks:
+
+```powershell
+node --test tests/test_site_map_tracking.cjs
+.venv\Scripts\python.exe server.py --port 8002 --runtime-dir runtime/map-validation
+```
+
+Against an isolated runtime containing analyzed camera data and observed incidents:
+
+```powershell
+node tests/browser_site_map.mjs
+```
+
+The browser check covers actual recorded-source person dots, incident animation without map rotation, snapshot selection, placement persistence, resolution/false-positive transitions, map lifecycle, dark/light themes, and mobile/RTL layout. It restores the original review statuses after testing. The webcam browser regression also verifies webcam dots at the explicitly selected map station.
