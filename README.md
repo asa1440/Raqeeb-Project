@@ -1,4 +1,4 @@
-# Raqeeb
+# Raqeeb (with chat bot)
 
 Security presentation dashboard with recorded camera sources and actual local AI recognition.
 
@@ -56,7 +56,8 @@ A **CAM-LIVE** tile appears next to the recorded cameras. By default the webcam 
 - **Delete** (Evidence library cards and the evidence popup) removes an incident after confirmation; **Delete all** in the Evidence library header removes every incident, including archived false positives. For the live webcam it also deletes the snapshot, which cannot be recovered. For recorded cameras the snapshot file is kept because the video's analysis cache needs it, and the alert can reappear if that footage is replayed.
 - Unsupported alerts from older analyses are archived as False Positive, preserving review history. They are excluded from live activity and notifications.
 - Each weapon appearance alerts once per browser session. **Restart footage** rearms popups without duplicating saved incidents. The footage continues playing while an operator reviews an alert.
-- Person Search matches clothing color, camera ID, or track ID from analyzed footage. Clothing colors are approximate, and search results are historical source tracks, not identities.
+- Person Search uses Gemini to answer questions about clothing, hands visible in snapshots, person tracks, incident priority, source time, and detected weapon type. Answers include the related person and incident snapshots when available. Clothing colors are approximate automated metadata; times refer to seconds in the recorded clip, not wall-clock time.
+- Copy `.env.example` to `.env` and enter your Gemini key in `.env` before starting Raqeeb. `.env` is ignored by Git; an existing server environment variable takes precedence. The key stays on the server and is never sent to the browser. Questions send track/incident metadata and up to 12 snapshots to Google's Gemini API; do not enable this for footage you are not allowed to share with Google.
 
 Model scores are not guarantees. A small or briefly visible weapon may be missed, and false positives remain possible. Analysis samples are not every video frame. Tune sampling and confidence when needed:
 

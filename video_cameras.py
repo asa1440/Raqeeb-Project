@@ -4,6 +4,7 @@ Videos are analyzed locally once, then played at their native frame rate in the
 browser. Detections are indexed by source timestamp, never by a demo timer.
 """
 
+import base64
 import csv
 import hashlib
 import io
@@ -18,7 +19,9 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
@@ -1002,6 +1005,110 @@ def make_video_handler(library):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def gemini_chat(self, question):
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                return self.reply(503, {"error": "Set GEMINI_API_KEY in the server environment to enable the assistant."})
+
+            with library.lock:
+                analyses = list(library.analyses.items())
+                incidents = list(library.incidents)
+            incidents_by_id = {incident.get("id"): incident for incident in incidents}
+
+            records = []
+            seen_people = set()
+            seen_events = set()
+            for camera_id, analysis in analyses:
+                for track in analysis.get("tracks", []):
+                    if track.get("class") != "person" or track.get("id") in seen_people:
+                        continue
+                    person_id = track.get("id")
+                    seen_people.add(person_id)
+                    records.append({
+                        "kind": "person", "id": person_id, "camera": camera_id,
+                        "color": track.get("color"), "first_seen": track.get("first_seen"),
+                        "last_seen": track.get("last_seen"), "snapshot_time": track.get("snapshot_time"),
+                        "path": library.evidence / f"person-{person_id}.jpg",
+                        "url": f"/api/people/{person_id}/snapshot.jpg",
+                    })
+                for event in analysis.get("events", []):
+                    evidence_name = event.get("evidence_file")
+                    if not evidence_name or not re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", evidence_name):
+                        continue
+                    event_id = event.get("id")
+                    if event_id in seen_events:
+                        continue
+                    seen_events.add(event_id)
+                    saved_incident = incidents_by_id.get(event_id, {})
+                    records.append({
+                        "kind": "incident", "id": event_id, "camera": camera_id,
+                        "type": saved_incident.get("type", event.get("type")),
+                        "severity": saved_incident.get("severity", event.get("severity", "CRITICAL")),
+                        "status": saved_incident.get("status", "Detected"),
+                        "time": event.get("time"), "person_id": event.get("person_id"),
+                        "path": library.evidence / evidence_name,
+                        "url": f"/api/evidence/{evidence_name}",
+                    })
+            for incident in incidents:
+                evidence_name = incident.get("evidence_file")
+                if not evidence_name or not re.fullmatch(r"[a-f0-9]{16}-(gun|knife)-\d+\.jpg", evidence_name):
+                    continue
+                if incident.get("id") in seen_events:
+                    continue
+                seen_events.add(incident.get("id"))
+                records.append({
+                    "kind": "incident", "id": incident.get("id"), "camera": incident.get("camera"),
+                    "type": incident.get("type"), "severity": incident.get("severity"), "status": incident.get("status"),
+                    "time": incident.get("time"), "person_id": incident.get("person_id"),
+                    "path": library.evidence / evidence_name,
+                    "url": f"/api/evidence/{evidence_name}",
+                })
+
+            people = [record for record in records if record["kind"] == "person"]
+            events = [record for record in records if record["kind"] == "incident"]
+            records = [group[index] for index in range(max(len(people), len(events)))
+                       for group in (people, events) if index < len(group)]
+            record_data = [{k: v for k, v in record.items() if k not in ("path", "url")} for record in records]
+            prompt = (
+                "Answer in the same language as the user's question. Use only the provided camera records and images; "
+                "never guess a person's identity or details. Distinguish recorded metadata from visual observations, "
+                "state when an image is unclear, and cite person IDs, camera IDs, and source times when relevant. "
+                "Clothing colors are approximate automated metadata. Times are seconds from the recorded clip; "
+                "no wall-clock recording time is available, so do not infer one. A detected weapon event is a model alert, not proof of intent.\n"
+                f"User question: {question}\nCamera records (JSON): {json.dumps(record_data, ensure_ascii=False)}"
+            )
+            parts = [{"text": prompt}]
+            attached = []
+            for record in records:
+                if len(attached) >= 12 or not record["path"].is_file():
+                    continue
+                try:
+                    image = record["path"].read_bytes()
+                except OSError:
+                    continue
+                if len(image) > 4 * 1024 * 1024:
+                    continue
+                label = f"{record['kind']} {record['id']} from {record['camera']}"
+                parts.extend(({"text": f"Snapshot: {label}"}, {
+                    "inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image).decode("ascii")}
+                }))
+                attached.append({"kind": record["kind"], "id": record["id"], "camera": record["camera"], "url": record["url"]})
+
+            model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?{urlencode({'key': api_key})}"
+            payload = json.dumps({"contents": [{"role": "user", "parts": parts}]}).encode()
+            request = Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urlopen(request, timeout=45) as response:
+                    result = json.loads(response.read())
+                answer = "".join(part.get("text", "") for part in result["candidates"][0]["content"]["parts"])
+                if not answer:
+                    raise ValueError("Gemini returned an empty response")
+            except (HTTPError, URLError, TimeoutError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+                detail = getattr(exc, "reason", None) or str(exc)
+                return self.reply(502, {"error": f"Gemini request failed: {detail}"})
+            return self.reply(200, {"answer": answer, "images": attached})
+
         def do_HEAD(self):
             self.do_GET()
 
@@ -1098,6 +1205,11 @@ def make_video_handler(library):
                 if length <= 0 or length > 16384:
                     return self.reply(400, {"error": "Invalid request size"})
                 data = json.loads(self.rfile.read(length))
+                if self.path == "/api/chat":
+                    question = data.get("message", "").strip()
+                    if not question or len(question) > 2000:
+                        return self.reply(400, {"error": "Message must be between 1 and 2000 characters."})
+                    return self.gemini_chat(question)
                 if self.path == "/api/incidents":
                     return self.reply(200, library.activate(data["camera"], data["event_id"]))
                 if self.path == "/api/incidents/delete-all":
