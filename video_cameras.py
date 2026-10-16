@@ -710,6 +710,12 @@ class CameraLibrary:
 
 
 def make_video_handler(library):
+    clothing_query = re.compile(
+        r"\b(?:wear(?:ing)?|clothes|clothing|shirt|jacket|coat|pants|trousers|dress|uniform|color|colour)\b"
+        r"|لبس|لابس|لابسة|يرتدي|ترتدي|ملابس|قميص|جاكيت|معطف|بنطال|فستان|زي|لون|باللون",
+        re.IGNORECASE,
+    )
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -776,6 +782,8 @@ def make_video_handler(library):
             if not api_key:
                 return self.reply(503, {"error": "Set GEMINI_API_KEY in the server environment or .env file to enable the assistant."})
 
+            visual_clothing_search = bool(clothing_query.search(question))
+
             with library.lock:
                 analyses = list(library.analyses.items())
                 incidents = list(library.incidents)
@@ -832,17 +840,27 @@ def make_video_handler(library):
 
             people = [record for record in records if record["kind"] == "person"]
             events = [record for record in records if record["kind"] == "incident"]
-            records = [group[index] for index in range(max(len(people), len(events)))
-                       for group in (people, events) if index < len(group)]
-            record_data = [{key: value for key, value in record.items() if key not in ("path", "url")} for record in records]
+            records = (people if visual_clothing_search else
+                       [group[index] for index in range(max(len(people), len(events)))
+                        for group in (people, events) if index < len(group)])
+            record_data = [{key: value for key, value in record.items()
+                            if key not in (("path", "url", "color") if visual_clothing_search else ("path", "url"))}
+                           for record in records]
             prompt = (
-                "Answer in the same language as the user's question. Use only the provided camera records and images; "
+                "Answer in the english language as the user's question. Use only the provided camera records and images; "
                 "never guess a person's identity or details. Distinguish recorded metadata from visual observations, "
                 "state when an image is unclear, and cite person IDs, camera IDs, and source times when relevant. "
-                "Clothing colors are approximate automated metadata. Times are seconds from the recorded clip; "
+                "Times are seconds from the recorded clip; "
                 "no wall-clock recording time is available, so do not infer one. A detected weapon event is a model alert, not proof of intent.\n"
                 f"User question: {question}\nCamera records (JSON): {json.dumps(record_data, ensure_ascii=False)}"
             )
+            if visual_clothing_search:
+                prompt += (
+                    "\nFor this clothing query, inspect each attached person snapshot directly. Determine clothing colors "
+                    "from visible pixels only; do not use catalog or location metadata to infer appearance. "
+                    "Return valid JSON with an answer string and matched_person_ids array. Include only IDs whose "
+                    "clothing visibly matches the user's request; leave the array empty when none can be confirmed."
+                )
             parts = [{"text": prompt}]
             attached = []
             for record in records:
@@ -862,7 +880,10 @@ def make_video_handler(library):
 
             model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent"
-            payload = json.dumps({"contents": [{"role": "user", "parts": parts}]}).encode()
+            payload_data = {"contents": [{"role": "user", "parts": parts}]}
+            if visual_clothing_search:
+                payload_data["generationConfig"] = {"responseMimeType": "application/json"}
+            payload = json.dumps(payload_data).encode()
             request = Request(endpoint, data=payload, headers={
                 "Content-Type": "application/json", "x-goog-api-key": api_key
             }, method="POST")
@@ -875,6 +896,15 @@ def make_video_handler(library):
                 answer = "".join(part.get("text", "") for part in result["candidates"][0]["content"]["parts"])
                 if not answer:
                     raise ValueError("Gemini returned an empty response")
+                if visual_clothing_search:
+                    visual_result = json.loads(answer)
+                    answer = visual_result.get("answer")
+                    matched_ids = visual_result.get("matched_person_ids", [])
+                    if not isinstance(answer, str) or not answer or not isinstance(matched_ids, list):
+                        raise ValueError("Gemini returned an invalid visual search response")
+                    matched_ids = {person_id for person_id in matched_ids if isinstance(person_id, str)}
+                    attached = [image for image in attached
+                                if image["kind"] == "person" and image["id"] in matched_ids]
             except (HTTPError, URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 detail = getattr(exc, "reason", None) or str(exc)
                 return self.reply(502, {"error": f"Gemini request failed: {detail}"})

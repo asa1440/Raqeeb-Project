@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from http.server import ThreadingHTTPServer
+from unittest.mock import MagicMock, patch
 
 from video_cameras import CameraLibrary, PersonIDs, box_iou, discover_videos, make_video_handler, weapon_kind, weapon_owner
 
@@ -157,6 +158,33 @@ class VideoCameraTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    def test_chat_clothing_search_uses_visual_match_and_returns_matching_photo(self):
+        self.library.analyses["CAM-01"]["tracks"] = [
+            {"class": "person", "id": "P-0001", "color": "blue", "first_seen": 1},
+            {"class": "person", "id": "P-0002", "color": "yellow", "first_seen": 2},
+        ]
+        for person_id in ("P-0001", "P-0002"):
+            (self.library.evidence / f"person-{person_id}.jpg").write_bytes(b"jpeg image")
+
+        gemini_response = MagicMock()
+        gemini_response.__enter__.return_value.read.return_value = json.dumps({
+            "candidates": [{"content": {"parts": [{"text": json.dumps({
+                "answer": "وجدت الشخص الذي يرتدي اللون الأحمر.",
+                "matched_person_ids": ["P-0002"],
+            })}]}}]
+        }).encode()
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
+                patch("video_cameras.urlopen", return_value=gemini_response) as gemini:
+            status, result = self.post_json("/api/chat", {"message": "أرسل صورة شخص لابس أحمر"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual([image["id"] for image in result["images"]], ["P-0002"])
+        request_data = json.loads(gemini.call_args.args[0].data)
+        prompt = request_data["contents"][0]["parts"][0]["text"]
+        self.assertIn("visible pixels only", prompt)
+        self.assertNotIn('"color":', prompt)
+        self.assertEqual(request_data["generationConfig"]["responseMimeType"], "application/json")
 
     def test_delete_live_incident_removes_snapshot(self):
         snapshot = self.library.evidence / "0123456789abcdef-knife-1.jpg"
