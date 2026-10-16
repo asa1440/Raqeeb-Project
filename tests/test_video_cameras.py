@@ -183,6 +183,7 @@ class VideoCameraTests(unittest.TestCase):
         request_data = json.loads(gemini.call_args.args[0].data)
         prompt = request_data["contents"][0]["parts"][0]["text"]
         self.assertIn("visible pixels only", prompt)
+        self.assertIn("Return valid JSON", prompt)
         self.assertNotIn('"color":', prompt)
         self.assertEqual(request_data["generationConfig"]["responseMimeType"], "application/json")
 
